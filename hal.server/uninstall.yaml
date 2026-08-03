@@ -1,0 +1,98 @@
+---
+# Remove the vLLM container deployment from hal.
+#
+#   ansible-playbook uninstall.yaml -K
+#
+# Model weights and the image are kept by default -- both are large and slow to
+# re-fetch. To remove them:
+#
+#   ansible-playbook uninstall.yaml -K -e vllm_remove_models=true -e vllm_remove_image=true
+#
+# Docker itself is never removed; it is general-purpose and may be in use by
+# other things on this host.
+
+- name: Uninstall vLLM
+  hosts: vllm
+  become: true
+  gather_facts: false
+
+  vars:
+    vllm_remove_models: false
+    vllm_remove_image: false
+
+  tasks:
+    - name: Stop and disable the service
+      ansible.builtin.systemd_service:
+        name: "{{ vllm_service_name }}"
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Remove the unit file
+      ansible.builtin.file:
+        path: "/etc/systemd/system/{{ vllm_service_name }}.service"
+        state: absent
+      notify: Reload systemd
+
+    - name: Remove any lingering container
+      ansible.builtin.command: "docker rm -f {{ vllm_container_name }}"
+      register: rm_container
+      changed_when: vllm_container_name in (rm_container.stdout | default(''))
+      failed_when: false
+
+    - name: Remove the GTT kernel command line drop-in
+      ansible.builtin.file:
+        path: /etc/default/grub.d/99-vllm-gtt.cfg
+        state: absent
+      notify: Regenerate grub config
+
+    - name: Close the firewall port
+      community.general.ufw:
+        rule: allow
+        port: "{{ vllm_port }}"
+        proto: tcp
+        src: "{{ vllm_firewall_source }}"
+        delete: true
+      failed_when: false
+
+    - name: Remove the environment file
+      ansible.builtin.file:
+        path: "{{ vllm_home }}/vllm.env"
+        state: absent
+
+    - name: Remove the container image
+      ansible.builtin.command: "docker rmi {{ vllm_image_ref }}"
+      when: vllm_remove_image | bool
+      changed_when: true
+      failed_when: false
+
+    - name: Remove downloaded model weights
+      ansible.builtin.file:
+        path: "{{ vllm_models_dir }}"
+        state: absent
+      when: vllm_remove_models | bool
+
+    - name: Remove the vLLM home directory
+      ansible.builtin.file:
+        path: "{{ vllm_home }}"
+        state: absent
+      when: vllm_remove_models | bool
+
+    - name: Report what was kept
+      ansible.builtin.debug:
+        msg:
+          - "{{ 'Model weights removed.' if vllm_remove_models | bool
+                else 'Model weights kept at ' ~ vllm_models_dir ~
+                     ' (-e vllm_remove_models=true to delete).' }}"
+          - "{{ 'Image removed.' if vllm_remove_image | bool
+                else 'Image kept (-e vllm_remove_image=true to delete).' }}"
+          - "Docker was left installed."
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+    - name: Regenerate grub config
+      ansible.builtin.command: update-grub
+      changed_when: true

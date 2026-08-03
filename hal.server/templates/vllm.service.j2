@@ -1,0 +1,55 @@
+{{ ansible_managed | comment }}
+[Unit]
+Description=vLLM OpenAI-compatible API server ({{ vllm_served_model_name }})
+Documentation=https://docs.vllm.ai/
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+# Clear any container left behind by an unclean shutdown; `-` ignores failure
+# when there is nothing to remove.
+ExecStartPre=-/usr/bin/docker rm -f {{ vllm_container_name }}
+
+ExecStart=/usr/bin/docker run --rm --name {{ vllm_container_name }} \
+    --device /dev/kfd \
+    --device /dev/dri \
+    --group-add {{ vllm_render_gid }} \
+    --group-add {{ vllm_video_gid }} \
+{% if vllm_shm_ipc_host | bool %}
+    --ipc host \
+{% endif %}
+{% for flag in vllm_container_extra_flags %}
+    {{ flag }} \
+{% endfor %}
+    --publish {{ vllm_bind_host }}:{{ vllm_port }}:8000 \
+    --env-file {{ vllm_home }}/vllm.env \
+    --volume {{ vllm_models_dir }}:{{ vllm_container_models_dir }} \
+    {{ vllm_image_ref }} \
+    vllm serve {{ vllm_model }} \
+    --served-model-name {{ vllm_served_model_name }} \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --download-dir {{ vllm_container_models_dir }}/hub \
+    --dtype {{ vllm_dtype }} \
+    --max-model-len {{ vllm_max_model_len }} \
+    --gpu-memory-utilization {{ vllm_gpu_memory_utilization }}{% for arg in vllm_extra_args %} \
+    {{ arg }}{% endfor %}
+
+
+ExecStop=/usr/bin/docker stop --time 30 {{ vllm_container_name }}
+
+# Loading and compiling a 30B MoE on first boot is slow; do not let systemd
+# declare failure while HIP graphs are still being captured.
+TimeoutStartSec=1800
+TimeoutStopSec=90
+Restart=on-failure
+RestartSec=15
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier={{ vllm_service_name }}
+
+[Install]
+WantedBy=multi-user.target

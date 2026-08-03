@@ -1,0 +1,165 @@
+---
+# ---------------------------------------------------------------------------
+# Target hardware: AMD Ryzen AI Max ("Strix Halo"), Radeon 8060S iGPU, gfx1151.
+#
+# Container deployment: AMD publishes a prebuilt gfx1151 vLLM image, so the host
+# needs only Docker and the in-tree amdgpu kernel driver. No ROCm, no PyTorch
+# and no Python build environment is installed on hal itself.
+# ---------------------------------------------------------------------------
+
+# --- Image ----------------------------------------------------------------
+vllm_image_repo: "rocm/vllm"
+vllm_image_tag: "rocm7.13.0_gfx1151_ubuntu24.04_py3.13_pytorch_2.10.0_vllm_0.19.1"
+# Pinned so a retagged upstream image cannot silently change what runs here.
+# Verified against Docker Hub on 2026-08-02 (10.3 GB, pushed 2026-05-19).
+vllm_image_digest: "sha256:394194d36edcf9b36bcb563e143b21b80e64e7d04f33a447b448c0c0c00c04a8"
+# Set false to track the mutable tag instead of the digest.
+vllm_image_pin_digest: true
+
+vllm_image_ref: >-
+  {{ vllm_image_repo ~ '@' ~ vllm_image_digest
+     if vllm_image_pin_digest | bool
+     else vllm_image_repo ~ ':' ~ vllm_image_tag }}
+
+# --- Host paths and service identity --------------------------------------
+vllm_container_name: vllm
+vllm_service_name: vllm
+vllm_home: /opt/vllm
+vllm_models_dir: "{{ vllm_home }}/models"
+# Where the models volume is mounted inside the container.
+vllm_container_models_dir: /app/models
+
+# --- Docker ---------------------------------------------------------------
+vllm_install_docker: true
+docker_apt_packages:
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - docker-buildx-plugin
+# Users to add to the docker group so they can run `docker logs vllm` etc.
+# NOTE: docker group membership is root-equivalent.
+docker_group_users:
+  - matthew
+
+# --- Host-side GPU access -------------------------------------------------
+# The container reaches the GPU as root via --device and numeric --group-add,
+# so it does not need these. Human users do: /dev/dri/* and /dev/kfd are mode
+# 0660 root:render / root:video, so host tools (nvtop, rocm-smi, amdgpu_top)
+# report "No GPU to monitor" without membership.
+# Group changes only take effect on a new login session.
+vllm_gpu_group_users:
+  - matthew
+
+# Host-side GPU monitoring. nvtop dlopens libdrm_amdgpu.so.1 at runtime and does
+# not declare it in Depends, so without libdrm-amdgpu1 it skips the AMD backend
+# and reports "No GPU to monitor" -- with no hint that a library is missing.
+vllm_install_gpu_tools: true
+vllm_host_gpu_tools:
+  - libdrm-amdgpu1
+  - nvtop
+
+# --- Model ----------------------------------------------------------------
+# AWQ 4-bit with group_size=128. That combination is load-bearing on gfx1151;
+# the more obvious choices all fail to start:
+#
+#   Qwen/...-FP8            block-scaled FP8 (128x128); no FP8 MoE backend on
+#                           ROCm implements block scales, so the engine refuses
+#                           to start with "No FP8 MoE backend supports ...".
+#   cyankiwi/...-AWQ-4bit   AWQ but group_size=32; ConchLinearKernel supports
+#                           only [-1, 128], so no WNA16 kernel can be found.
+#   BF16                    ~61 GB of weights; will not fit in 64 GiB with a
+#                           usable KV cache.
+#
+# ALWAYS check `group_size` in the repo's config.json before switching models.
+#
+# Measured on hal with the sibling ELVISIO/Qwen3-30B-A3B-Instruct-2507-AWQ
+# (same architecture and quantisation): 15.87 GiB of weights, 40.83 GiB KV cache
+# free (445,984 tokens), engine init 7.4 s. This Coder repo was verified to
+# select the awq_marlin kernel on gfx1151. See README.md before changing this.
+vllm_model: "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ"
+vllm_served_model_name: "qwen3-coder-30b"
+# The model's native context is 262144. Measured KV cache on hal is 40.83 GiB
+# = 445,984 tokens (~96 KiB/token: 48 layers x 4 KV heads x 128 dim x 2 x 2 B),
+# so a 131072-token sequence costs ~12 GiB and three can be resident at once.
+# Raised from 32768 because coding agents burn context fast.
+vllm_max_model_len: 131072
+vllm_gpu_memory_utilization: 0.90
+vllm_dtype: auto
+
+# Pull weights during the play rather than on first request, so the service
+# does not look hung for 20 minutes on initial start.
+vllm_prefetch_model: true
+
+# Set if the model repo is gated. Pass via --extra-vars or vault; never commit.
+vllm_hf_token: ""
+
+# --- Server ---------------------------------------------------------------
+# Host-side bind address and port. vLLM always listens on 8000 inside the
+# container; this is the published mapping.
+vllm_bind_host: "0.0.0.0"
+vllm_port: 8000
+# If set, clients must send `Authorization: Bearer <key>`. Empty = open on LAN.
+vllm_api_key: ""
+
+# Appended verbatim to `vllm serve`. One list entry per token.
+#
+# Tool calling is mandatory for coding agents (Pi, etc.): without
+# --enable-auto-tool-choice vLLM returns tool calls as raw text in the message
+# content instead of a structured tool_calls array, and the agent cannot act.
+# The parser must match the model's tool-call format: `qwen3_coder` for
+# Qwen3-Coder, `hermes` for Qwen3 Instruct. Changing the model without changing
+# this yields empty tool_calls with the call rendered as text in content.
+vllm_extra_args:
+  - "--max-num-seqs"
+  - "8"
+  - "--enable-prefix-caching"
+  - "--enable-auto-tool-choice"
+  - "--tool-call-parser"
+  - "qwen3_coder"
+
+# --- Container runtime flags ----------------------------------------------
+# vLLM's engine leans on shared memory heavily; --ipc host is what AMD documents.
+vllm_shm_ipc_host: true
+vllm_container_extra_flags:
+  - "--cap-add=SYS_PTRACE"
+  - "--security-opt=seccomp=unconfined"
+
+# Passed into the container. gfx1151 is natively supported in ROCm 7.13, so
+# HSA_OVERRIDE_GFX_VERSION is deliberately NOT set -- forcing it to 11.0.0 as
+# older Strix Halo guides suggest would select the wrong kernels.
+#
+# Deliberately NOT set here:
+#   VLLM_ROCM_USE_AITER        - vLLM's backend oracle treats this being *set*
+#                                as an explicit request and drops AITER from the
+#                                candidate list without testing it. AITER already
+#                                reports "does not support current device rocm"
+#                                on gfx1151, so pinning it to 0 gains nothing and
+#                                would suppress AITER if a future image adds
+#                                RDNA support.
+#   VLLM_USE_TRITON_FLASH_ATTN - removed in vLLM 0.19.1, which logs it as an
+#                                "Unknown vLLM environment variable".
+vllm_environment:
+  PYTORCH_HIP_ALLOC_CONF: "expandable_segments:True"
+  HIP_VISIBLE_DEVICES: "0"
+  SAFETENSORS_FAST_GPU: "1"
+  TOKENIZERS_PARALLELISM: "false"
+
+# --- Optional host tuning --------------------------------------------------
+# hal already carves 64 GiB to VRAM, so raising the GTT ceiling buys nothing.
+# Enable only if you shrink the BIOS UMA carveout. REQUIRES A REBOOT.
+vllm_tune_gtt: false
+vllm_gtt_size_gib: 48
+
+# Open the API port with ufw, if ufw is installed and active.
+vllm_manage_firewall: true
+vllm_firewall_source: "10.1.1.0/24"
+
+# --- Preflight -------------------------------------------------------------
+# Measured, not estimated: the image is 10.3 GB compressed but 47 GB extracted
+# (ROCm layers compress ~4.6x). Preflight only requires space for the artefacts
+# that are actually still missing, so re-runs after a successful pull do not
+# fail on space the pull itself consumed.
+vllm_image_disk_gb: 47
+# AWQ 4-bit weights are ~17 GB on disk (vs ~32 GB for the FP8 repo).
+vllm_model_disk_gb: 20
+vllm_disk_headroom_gb: 10

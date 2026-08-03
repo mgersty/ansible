@@ -1,0 +1,425 @@
+---
+# Run vLLM on hal (AMD Strix Halo / gfx1151) as a Docker container managed by
+# systemd.
+#
+#   ansible-playbook vllm.yml -K
+#
+# The host gets Docker and nothing else: no ROCm, no PyTorch, no Python build
+# environment. All of that lives inside AMD's prebuilt gfx1151 image.
+
+- name: Deploy vLLM as a container on gfx1151
+  hosts: vllm
+  become: true
+  gather_facts: true
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+    - name: Restart vllm
+      ansible.builtin.systemd_service:
+        name: "{{ vllm_service_name }}"
+        state: restarted
+
+    - name: Regenerate grub config
+      ansible.builtin.command: update-grub
+      changed_when: true
+
+  tasks:
+    # -----------------------------------------------------------------------
+    - name: Preflight
+      tags: [preflight]
+      block:
+        - name: Verify the amdgpu compute device is present
+          ansible.builtin.stat:
+            path: /dev/kfd
+          register: kfd
+
+        - name: Fail if /dev/kfd is missing
+          ansible.builtin.assert:
+            that: kfd.stat.exists
+            fail_msg: >-
+              /dev/kfd not found. The amdgpu kernel driver is not loaded, so the
+              container cannot reach the GPU no matter how it is configured.
+              Check `dmesg | grep amdgpu` and the BIOS iGPU setting.
+
+        - name: Verify a render node exists
+          ansible.builtin.find:
+            paths: /dev/dri
+            patterns: "renderD*"
+            file_type: any
+          register: render_nodes
+
+        - name: Fail if no render node is present
+          ansible.builtin.assert:
+            that: render_nodes.matched > 0
+            fail_msg: "No /dev/dri/renderD* node found; the GPU is not usable."
+
+        - name: Check free disk space
+          ansible.builtin.set_fact:
+            vllm_free_gb: >-
+              {{ (ansible_facts['mounts']
+                  | selectattr('mount', 'equalto', '/')
+                  | map(attribute='size_available')
+                  | first / 1073741824) | round(1) }}
+
+        # Only demand room for what is still missing. A flat threshold is wrong
+        # here: once the 47 GB image is pulled it consumes the very space the
+        # check was demanding, so every later run would fail.
+        - name: Check whether the image is already pulled
+          ansible.builtin.command: "docker image inspect {{ vllm_image_ref }}"
+          register: preflight_image
+          changed_when: false
+          failed_when: false
+
+        # Guarded by a stat because on a first run the directory does not exist
+        # yet, and find would emit a confusing "not a directory" warning.
+        - name: Check whether the models directory exists
+          ansible.builtin.stat:
+            path: "{{ vllm_models_dir }}"
+          register: preflight_models_dir
+
+        - name: Check whether model weights are already downloaded
+          ansible.builtin.find:
+            paths: "{{ vllm_models_dir }}"
+            patterns: "*.safetensors"
+            recurse: true
+            file_type: file
+          register: preflight_weights
+          when: preflight_models_dir.stat.isdir | default(false)
+
+        - name: Compute the space still required
+          ansible.builtin.set_fact:
+            vllm_required_gb: >-
+              {{ ((vllm_image_disk_gb if preflight_image.rc | default(1) != 0 else 0)
+                  + (vllm_model_disk_gb if (preflight_weights.matched | default(0)) | int == 0 else 0)
+                  + vllm_disk_headroom_gb) | float }}
+
+        - name: Fail if the disk cannot hold what is still missing
+          ansible.builtin.assert:
+            that: vllm_free_gb | float >= vllm_required_gb | float
+            fail_msg: >-
+              Only {{ vllm_free_gb }} GB free on / but {{ vllm_required_gb }} GB is
+              still required
+              ({{ 'image ' ~ vllm_image_disk_gb ~ ' GB' if preflight_image.rc | default(1) != 0 else 'image already pulled' }};
+              {{ 'weights ' ~ vllm_model_disk_gb ~ ' GB' if (preflight_weights.matched | default(0)) | int == 0 else 'weights already present' }};
+              headroom {{ vllm_disk_headroom_gb }} GB).
+              This host has a 1.8 TB NVMe with most of the volume group unallocated,
+              so the fix is usually to grow the root LV rather than to free space:
+              sudo lvextend -l +100%FREE /dev/ubuntu-vg/ubuntu-lv && sudo resize2fs /dev/ubuntu-vg/ubuntu-lv
+            success_msg: >-
+              {{ vllm_free_gb }} GB free, {{ vllm_required_gb }} GB still required.
+
+    # -----------------------------------------------------------------------
+    - name: Install Docker
+      tags: [docker]
+      when: vllm_install_docker | bool
+      block:
+        - name: Install apt prerequisites
+          ansible.builtin.apt:
+            name:
+              - ca-certificates
+              - curl
+              - gnupg
+              # Required by deb822_repository, which will not install it itself
+              # unless install_python_debian is set.
+              - python3-debian
+            state: present
+            update_cache: true
+            cache_valid_time: 3600
+
+        - name: Create the apt keyring directory
+          ansible.builtin.file:
+            path: /etc/apt/keyrings
+            state: directory
+            owner: root
+            group: root
+            mode: "0755"
+
+        - name: Install the Docker apt key
+          ansible.builtin.get_url:
+            url: https://download.docker.com/linux/ubuntu/gpg
+            dest: /etc/apt/keyrings/docker.asc
+            owner: root
+            group: root
+            mode: "0644"
+
+        - name: Add the Docker apt repository
+          ansible.builtin.deb822_repository:
+            name: docker
+            types: [deb]
+            uris: "https://download.docker.com/linux/ubuntu"
+            suites: ["{{ ansible_facts['distribution_release'] }}"]
+            components: [stable]
+            architectures: >-
+              {{ ['amd64'] if ansible_facts['architecture'] == 'x86_64'
+                 else [ansible_facts['architecture']] }}
+            signed_by: /etc/apt/keyrings/docker.asc
+            enabled: true
+            state: present
+          register: docker_repo
+
+        - name: Install Docker Engine
+          ansible.builtin.apt:
+            name: "{{ docker_apt_packages }}"
+            state: present
+            # deb822_repository does not refresh the cache itself.
+            update_cache: true
+
+        - name: Enable and start Docker
+          ansible.builtin.systemd_service:
+            name: docker
+            enabled: true
+            state: started
+
+        - name: Add users to the docker group
+          # Membership here is effectively root on this host.
+          ansible.builtin.user:
+            name: "{{ item }}"
+            groups: docker
+            append: true
+          loop: "{{ docker_group_users }}"
+
+    # -----------------------------------------------------------------------
+    - name: Resolve GPU device group IDs
+      tags: [always]
+      block:
+        # These must be numeric: `--group-add` resolves names against the
+        # container's /etc/group, but the device nodes are owned by host GIDs.
+        - name: Look up the render group
+          ansible.builtin.getent:
+            database: group
+            key: render
+
+        - name: Record the render GID
+          ansible.builtin.set_fact:
+            vllm_render_gid: "{{ ansible_facts.getent_group['render'][1] }}"
+
+        - name: Look up the video group
+          ansible.builtin.getent:
+            database: group
+            key: video
+
+        - name: Record the video GID
+          ansible.builtin.set_fact:
+            vllm_video_gid: "{{ ansible_facts.getent_group['video'][1] }}"
+
+        - name: Report the resolved GIDs
+          ansible.builtin.debug:
+            msg: "render={{ vllm_render_gid }} video={{ vllm_video_gid }}"
+
+        # Not needed by the container, which runs as root with the GIDs passed
+        # explicitly. This is so humans can run nvtop / rocm-smi / amdgpu_top on
+        # the host, which otherwise fail with "No GPU to monitor".
+        - name: Grant users host-side access to the GPU devices
+          ansible.builtin.user:
+            name: "{{ item }}"
+            groups: "{{ ['render', 'video'] }}"
+            append: true
+          loop: "{{ vllm_gpu_group_users }}"
+          register: gpu_groups
+
+        - name: Note that group changes need a new login
+          ansible.builtin.debug:
+            msg: >-
+              Added {{ gpu_groups.results | selectattr('changed') | map(attribute='item') | join(', ') }}
+              to render/video. Log out and back in for it to take effect.
+          when: gpu_groups.results | selectattr('changed') | list | length > 0
+
+    # -----------------------------------------------------------------------
+    - name: Install host GPU monitoring tools
+      tags: [tools]
+      when: vllm_install_gpu_tools | bool
+      ansible.builtin.apt:
+        name: "{{ vllm_host_gpu_tools }}"
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    # -----------------------------------------------------------------------
+    - name: Create host directories
+      tags: [dirs]
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - "{{ vllm_home }}"
+        - "{{ vllm_models_dir }}"
+        - "{{ vllm_models_dir }}/hub"
+
+    # -----------------------------------------------------------------------
+    - name: Pull the vLLM image
+      tags: [image]
+      block:
+        - name: Check whether the image is already present
+          ansible.builtin.command: "docker image inspect {{ vllm_image_ref }}"
+          register: image_present
+          changed_when: false
+          failed_when: false
+
+        - name: Pull {{ vllm_image_ref }}
+          # 10.3 GB compressed, 47 GB extracted.
+          ansible.builtin.command: "docker pull {{ vllm_image_ref }}"
+          when: image_present.rc != 0
+          changed_when: true
+          timeout: 3600
+          notify: Restart vllm
+
+        - name: Verify the image reports the expected vLLM version
+          ansible.builtin.command: >-
+            docker run --rm --entrypoint python3 {{ vllm_image_ref }}
+            -c "import vllm; print(vllm.__version__)"
+          register: image_vllm_version
+          changed_when: false
+
+        - name: Report the image contents
+          ansible.builtin.debug:
+            msg: "image provides vLLM {{ image_vllm_version.stdout | trim }}"
+
+    # -----------------------------------------------------------------------
+    - name: Verify the container can reach the GPU
+      tags: [image, verify]
+      # Proves the device passthrough and group IDs are right before we hand
+      # the same flags to systemd, where failures are harder to read.
+      ansible.builtin.command: >-
+        docker run --rm
+        --device /dev/kfd --device /dev/dri
+        --group-add {{ vllm_render_gid }} --group-add {{ vllm_video_gid }}
+        --entrypoint python3 {{ vllm_image_ref }}
+        -c "import torch; assert torch.cuda.is_available(), 'no ROCm device';
+        print(torch.cuda.get_device_name(0), torch.version.hip)"
+      register: gpu_check
+      changed_when: false
+
+    - name: Report the detected device
+      tags: [image, verify]
+      ansible.builtin.debug:
+        msg: "container sees: {{ gpu_check.stdout | trim }}"
+
+    # -----------------------------------------------------------------------
+    - name: Optionally raise the GTT ceiling
+      tags: [gtt]
+      when: vllm_tune_gtt | bool
+      block:
+        - name: Add amdttm page limits to the kernel command line
+          ansible.builtin.copy:
+            # 4 KiB pages, so GiB * 262144 pages.
+            content: |
+              # {{ ansible_managed }}
+              GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT amdttm.pages_limit={{ vllm_gtt_size_gib | int * 262144 }} amdttm.page_pool_size={{ vllm_gtt_size_gib | int * 262144 }}"
+            dest: /etc/default/grub.d/99-vllm-gtt.cfg
+            owner: root
+            group: root
+            mode: "0644"
+          notify: Regenerate grub config
+
+        - name: Warn that a reboot is required
+          ansible.builtin.debug:
+            msg: >-
+              GTT limits changed. Reboot hal for amdttm.pages_limit to take effect.
+
+    # -----------------------------------------------------------------------
+    - name: Pre-download model weights
+      tags: [model]
+      when: vllm_prefetch_model | bool
+      # Runs in the same image and the same volume the service will use, so the
+      # cache layout is identical to what vLLM expects at start.
+      ansible.builtin.command: >-
+        docker run --rm
+        --volume {{ vllm_models_dir }}:{{ vllm_container_models_dir }}
+        --env HF_HOME={{ vllm_container_models_dir }}
+        --env HF_HUB_CACHE={{ vllm_container_models_dir }}/hub
+        --env HF_TOKEN={{ vllm_hf_token }}
+        --entrypoint python3 {{ vllm_image_ref }}
+        -c "from huggingface_hub import snapshot_download;
+        snapshot_download('{{ vllm_model }}', max_workers=4)"
+      register: prefetch
+      changed_when: false
+      timeout: 7200
+
+    # -----------------------------------------------------------------------
+    - name: Configure the systemd service
+      tags: [service]
+      block:
+        - name: Write the environment file
+          ansible.builtin.template:
+            src: vllm.env.j2
+            dest: "{{ vllm_home }}/vllm.env"
+            owner: root
+            group: root
+            # May carry HF_TOKEN / VLLM_API_KEY.
+            mode: "0600"
+          notify: Restart vllm
+
+        - name: Write the unit file
+          ansible.builtin.template:
+            src: vllm.service.j2
+            dest: "/etc/systemd/system/{{ vllm_service_name }}.service"
+            owner: root
+            group: root
+            mode: "0644"
+          notify:
+            - Reload systemd
+            - Restart vllm
+
+        - name: Flush handlers so the service starts with current config
+          ansible.builtin.meta: flush_handlers
+
+        - name: Enable and start vLLM
+          ansible.builtin.systemd_service:
+            name: "{{ vllm_service_name }}"
+            enabled: true
+            state: started
+            daemon_reload: true
+
+    # -----------------------------------------------------------------------
+    - name: Open the API port
+      tags: [firewall]
+      when: vllm_manage_firewall | bool
+      block:
+        - name: Check whether ufw is present
+          ansible.builtin.command: ufw status
+          register: ufw_status
+          changed_when: false
+          failed_when: false
+
+        - name: Allow the vLLM port from the local network
+          # Docker's own iptables rules normally bypass ufw for published
+          # ports; this rule matters only if you also lock Docker down.
+          community.general.ufw:
+            rule: allow
+            port: "{{ vllm_port }}"
+            proto: tcp
+            src: "{{ vllm_firewall_source }}"
+            comment: "vLLM API"
+          when: ufw_status.rc == 0 and 'inactive' not in ufw_status.stdout
+
+    # -----------------------------------------------------------------------
+    - name: Wait for the API to become healthy
+      tags: [verify]
+      block:
+        - name: Poll the health endpoint
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ vllm_port }}/health"
+            status_code: 200
+          register: health
+          until: health.status == 200
+          retries: 60
+          delay: 20
+
+        - name: List the served models
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ vllm_port }}/v1/models"
+            headers: "{{ {'Authorization': 'Bearer ' + vllm_api_key} if vllm_api_key | length > 0 else {} }}"
+            return_content: true
+          register: models
+
+        - name: Report the endpoint
+          ansible.builtin.debug:
+            msg:
+              - "vLLM is serving: {{ models.json.data | map(attribute='id') | join(', ') }}"
+              - "Endpoint: http://{{ ansible_host }}:{{ vllm_port }}/v1"
