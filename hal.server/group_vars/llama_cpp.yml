@@ -1,0 +1,139 @@
+---
+# ---------------------------------------------------------------------------
+# Target hardware: AMD Ryzen AI Max ("Strix Halo"), Radeon 8060S iGPU, gfx1151.
+# Same box as the (retired) vllm group -- see group_vars/vllm.yml for why we
+# moved off vLLM.
+#
+# Backend: Vulkan (RADV), not ROCm/HIP. Measured on hal: ROCm/HIP is tuned for
+# CDNA (MI-series) and needs hand-tuning (ROCBLAS_USE_HIPBLASLT etc.) to be
+# competitive on RDNA 3.5; community benchmarks on gfx1151 in 2026 show
+# Vulkan/RADV ahead on decode throughput out of the box, which is what we're
+# bottlenecked on. Vulkan also means the host needs only /dev/dri (no
+# /dev/kfd, no ROCm userspace at all) -- simpler than the vLLM deployment, not
+# just faster.
+# ---------------------------------------------------------------------------
+
+# --- Image ------------------------------------------------------------------
+llama_cpp_image_repo: "ghcr.io/ggml-org/llama.cpp"
+llama_cpp_image_tag: "server-vulkan"
+# Pinned so a retagged upstream image cannot silently change what runs here.
+# Verified against GHCR on 2026-09-05 (amd64+arm64 index; ~310 MB amd64 image
+# -- llama.cpp ships no CUDA/ROCm runtime, so this is far lighter than vLLM's
+# 47 GB extracted image).
+llama_cpp_image_digest: "sha256:f862c901a0089bc3dc326bd24f208bfcd147839783328d252e911a004c94ff3c"
+llama_cpp_image_pin_digest: true
+
+llama_cpp_image_ref: >-
+  {{ llama_cpp_image_repo ~ '@' ~ llama_cpp_image_digest
+     if llama_cpp_image_pin_digest | bool
+     else llama_cpp_image_repo ~ ':' ~ llama_cpp_image_tag }}
+
+# --- Host paths and service identity ----------------------------------------
+llama_cpp_container_name: llama-cpp
+llama_cpp_service_name: llama-cpp
+llama_cpp_home: /opt/llama-cpp
+llama_cpp_models_dir: "{{ llama_cpp_home }}/models"
+llama_cpp_container_models_dir: /models
+
+# --- Docker ------------------------------------------------------------------
+# Shared with the vllm role. If both roles run on the same fresh host, either
+# can install Docker first; the apt tasks are idempotent.
+llama_cpp_install_docker: true
+docker_apt_packages:
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - docker-buildx-plugin
+docker_group_users:
+  - matthew
+
+# --- Host-side GPU access ----------------------------------------------------
+# Vulkan only needs the render node (/dev/dri), not /dev/kfd -- there is no
+# ROCm compute stack involved. The container runs as root, so --group-add is
+# for host tooling parity, not a hard requirement.
+llama_cpp_video_group_users:
+  - matthew
+llama_cpp_video_gid_group: video
+
+# --- Model --------------------------------------------------------------------
+# unsloth/Qwen3.8-27B-GGUF, UD-Q8_K_XL (Unsloth "Dynamic" quant), with the
+# separate Q4_0 MTP draft head. Per
+# https://unsloth.ai/docs/models/qwen3.8#run-qwen3.8-in-llama.cpp -- that
+# guide's build-from-source instructions are for a bare CUDA box; we use the
+# equivalent official Docker image instead, consistent with how this repo runs
+# vLLM, and because the host is meant to carry Docker and nothing else. The
+# unsloth guide's model choice and download URLs are what we follow here; its
+# llama.cpp build/install steps are not applicable to this host.
+#
+# The IQ1_XXXS / "iq1-narrow" fork mentioned in that guide is only needed for
+# the 2.4T-A95B variant's most extreme quant -- not used here. IQ2_S/IQ2_XXS
+# (one step below the target quality) are also that guide's territory for the
+# 2.4T MoE model, not this 27B dense one -- MoE models tend to tolerate
+# aggressive quantization much better than dense ones, so the lower quants are
+# materially riskier than the target.
+#
+# This workload is memory-bandwidth-bound on gfx1151 (confirmed on hal --
+# forcing --flash-attn on and quantizing the KV cache to q8_0 made no
+# measurable difference to decode speed under UD-Q4_K_XL, which only makes
+# sense if the bottleneck is re-reading the weights every token, not
+# attention/KV-cache traffic). That means fewer bits per weight is the lever
+# that actually helps here. Head-to-head on hal, identical prompts, same
+# flags otherwise:
+#
+#   UD-Q4_K_XL   16.35 GiB   ~12.0 tok/s decode (without MTP)
+#   UD-Q3_K_XL   13.15 GiB   ~14.8 tok/s decode
+#   UD-Q2_K_XL    9.15 GiB   ~18.7 tok/s decode
+#
+# MTP is enabled through llama.cpp's native draft-mtp path. Keep the draft
+# head at Q4_0 to limit its additional memory use; the server verifies the
+# proposed tokens against the UD-Q8_K_XL target model.
+#
+# The Q8 target is about 31.46 GB on disk; no Q8+MTP benchmark has been
+# recorded yet. Generation is expected to be more memory-bandwidth-bound than
+# the smaller quants, so measure after deployment. The configuration uses
+# --ctx-size 262144, with model load time dependent on storage speed.
+# --ctx-size 262144, model load ~5s (no torch.compile/CUDA-graph warmup step
+# the way vLLM has -- llama.cpp starts serving almost immediately).
+llama_cpp_model_repo: "unsloth/Qwen3.8-27B-GGUF"
+llama_cpp_model_file: "Qwen3.8-27B-UD-Q8_K_XL.gguf"
+llama_cpp_model_url: "https://huggingface.co/{{ llama_cpp_model_repo }}/resolve/main/{{ llama_cpp_model_file }}"
+llama_cpp_model_draft_file: "mtp-Qwen3.8-27B-Q4_0.gguf"
+llama_cpp_model_draft_url: "https://huggingface.co/{{ llama_cpp_model_repo }}/resolve/main/MTP/{{ llama_cpp_model_draft_file }}"
+llama_cpp_spec_draft_n_max: 3
+# Vision projector (mmproj) -- enables image input via --mmproj flag.
+# Without this, llama-server rejects image content with a 500 error.
+llama_cpp_model_mmproj_file: "mmproj-F16.gguf"
+llama_cpp_model_mmproj_url: "https://huggingface.co/{{ llama_cpp_model_repo }}/resolve/main/{{ llama_cpp_model_mmproj_file }}"
+# Served model id (OpenAI `model` field). Kept aligned with the vLLM-era name
+# so client configs (Pi, curl examples) only need the port/backend to change.
+llama_cpp_served_model_name: "qwen3.8-27b"
+# Native context is 262144 (extendable to 1M via YaRN; not enabled here).
+llama_cpp_ctx_size: 262144
+llama_cpp_gpu_layers: "all"
+llama_cpp_flash_attn: "auto"
+# deepseek: puts the model's <think>...</think> output in
+# message.reasoning_content instead of leaving it inline in message.content.
+llama_cpp_reasoning_format: "deepseek"
+
+# --- Server -------------------------------------------------------------------
+llama_cpp_bind_host: "0.0.0.0"
+llama_cpp_port: 8000
+# If set, clients must send `Authorization: Bearer <key>`. Empty = open on LAN
+# (same posture as the vllm role).
+llama_cpp_api_key: ""
+
+# Appended verbatim to the llama-server command line, after the flags the
+# template always sets. One list entry per token.
+llama_cpp_extra_args: []
+
+# --- Preflight ------------------------------------------------------------
+# Image is tiny compared to vLLM's; the model weights dominate.
+llama_cpp_image_disk_gb: 2
+# Target (31.46 GB) + MTP draft head (1.37 GB) + mmproj (0.885 GB), rounded up.
+llama_cpp_model_disk_gb: 36
+llama_cpp_disk_headroom_gb: 10
+
+# Open the API port with ufw, if ufw is installed and active. Same caveat as
+# the vllm role: Docker's own iptables rules bypass ufw for published ports.
+llama_cpp_manage_firewall: true
+llama_cpp_firewall_source: "10.1.1.0/24"

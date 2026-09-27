@@ -1,6 +1,26 @@
 all:
   children:
+    # Retired 2026-09-05: hal pivoted from vLLM to llama.cpp (see llama_cpp
+    # group below) because gfx1151 has no native MXFP4 kernel, and vLLM's
+    # simulated-dequant fallback for the model we needed measured ~1.9 tok/s
+    # vs. llama.cpp/Vulkan's ~12 tok/s for the same model. Left runnable for
+    # rollback -- group_vars/vllm.yml and templates/vllm.*.j2 are untouched.
     vllm:
+      hosts:
+        hal:
+          ansible_host: 10.1.1.105
+          ansible_user: matthew
+    llama_cpp:
+      hosts:
+        hal:
+          ansible_host: 10.1.1.105
+          ansible_user: matthew
+    laya_cpp:
+      hosts:
+        hal:
+          ansible_host: 10.1.1.105
+          ansible_user: matthew
+    trocr:
       hosts:
         hal:
           ansible_host: 10.1.1.105

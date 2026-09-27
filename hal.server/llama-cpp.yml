@@ -1,0 +1,340 @@
+---
+# Run llama.cpp (Vulkan backend) on hal (AMD Strix Halo / gfx1151) as a Docker
+# container managed by systemd.
+#
+#   ansible-playbook llama-cpp.yml -K
+#
+# The host gets Docker and nothing else -- no ROCm, no build toolchain. Unlike
+# the retired vllm role, this backend does not need /dev/kfd or any ROCm
+# userspace: Vulkan (RADV) only needs the render node.
+
+- name: Deploy llama.cpp as a container on gfx1151 (Vulkan)
+  hosts: llama_cpp
+  become: true
+  gather_facts: true
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+    - name: Restart llama-cpp
+      ansible.builtin.systemd_service:
+        name: "{{ llama_cpp_service_name }}"
+        state: restarted
+
+  tasks:
+    # -----------------------------------------------------------------------
+    - name: Preflight
+      tags: [preflight]
+      block:
+        - name: Verify a render node exists
+          ansible.builtin.find:
+            paths: /dev/dri
+            patterns: "renderD*"
+            file_type: any
+          register: render_nodes
+
+        - name: Fail if no render node is present
+          ansible.builtin.assert:
+            that: render_nodes.matched > 0
+            fail_msg: "No /dev/dri/renderD* node found; the GPU is not usable."
+
+        - name: Check free disk space
+          ansible.builtin.set_fact:
+            llama_cpp_free_gb: >-
+              {{ (ansible_facts['mounts']
+                  | selectattr('mount', 'equalto', '/')
+                  | map(attribute='size_available')
+                  | first / 1073741824) | round(1) }}
+
+        - name: Check whether the image is already pulled
+          ansible.builtin.command: "docker image inspect {{ llama_cpp_image_ref }}"
+          register: preflight_image
+          changed_when: false
+          failed_when: false
+
+        - name: Check whether the target model is already downloaded
+          ansible.builtin.stat:
+            path: "{{ llama_cpp_models_dir }}/{{ llama_cpp_model_file }}"
+          register: preflight_target_weights
+
+        - name: Check whether the MTP draft head is already downloaded
+          ansible.builtin.stat:
+            path: "{{ llama_cpp_models_dir }}/{{ llama_cpp_model_draft_file }}"
+          register: preflight_draft_weights
+
+        - name: Check whether the vision mmproj file is already downloaded
+          ansible.builtin.stat:
+            path: "{{ llama_cpp_models_dir }}/{{ llama_cpp_model_mmproj_file }}"
+          register: preflight_mmproj_weights
+
+        - name: Compute the space still required
+          ansible.builtin.set_fact:
+            llama_cpp_required_gb: >-
+              {{ ((llama_cpp_image_disk_gb if preflight_image.rc | default(1) != 0 else 0)
+                  + (llama_cpp_model_disk_gb
+                     if (not preflight_target_weights.stat.exists
+                         or not preflight_draft_weights.stat.exists
+                         or not preflight_mmproj_weights.stat.exists) else 0)
+                  + llama_cpp_disk_headroom_gb) | float }}
+
+        - name: Fail if the disk cannot hold what is still missing
+          ansible.builtin.assert:
+            that: llama_cpp_free_gb | float >= llama_cpp_required_gb | float
+            fail_msg: >-
+              Only {{ llama_cpp_free_gb }} GB free on / but {{ llama_cpp_required_gb }} GB
+              is still required
+              ({{ 'image ' ~ llama_cpp_image_disk_gb ~ ' GB' if preflight_image.rc | default(1) != 0 else 'image already pulled' }};
+              {{ 'model + MTP + mmproj weights ' ~ llama_cpp_model_disk_gb ~ ' GB'
+                 if (not preflight_target_weights.stat.exists
+                     or not preflight_draft_weights.stat.exists
+                     or not preflight_mmproj_weights.stat.exists)
+                 else 'model + MTP + mmproj weights already present' }};
+              headroom {{ llama_cpp_disk_headroom_gb }} GB).
+              sudo lvextend -l +100%FREE /dev/ubuntu-vg/ubuntu-lv && sudo resize2fs /dev/ubuntu-vg/ubuntu-lv
+            success_msg: >-
+              {{ llama_cpp_free_gb }} GB free, {{ llama_cpp_required_gb }} GB still required.
+
+    # -----------------------------------------------------------------------
+    - name: Install Docker
+      tags: [docker]
+      when: llama_cpp_install_docker | bool
+      block:
+        - name: Install apt prerequisites
+          ansible.builtin.apt:
+            name:
+              - ca-certificates
+              - curl
+              - gnupg
+              - python3-debian
+            state: present
+            update_cache: true
+            cache_valid_time: 3600
+
+        - name: Create the apt keyring directory
+          ansible.builtin.file:
+            path: /etc/apt/keyrings
+            state: directory
+            owner: root
+            group: root
+            mode: "0755"
+
+        - name: Install the Docker apt key
+          ansible.builtin.get_url:
+            url: https://download.docker.com/linux/ubuntu/gpg
+            dest: /etc/apt/keyrings/docker.asc
+            owner: root
+            group: root
+            mode: "0644"
+
+        - name: Add the Docker apt repository
+          ansible.builtin.deb822_repository:
+            name: docker
+            types: [deb]
+            uris: "https://download.docker.com/linux/ubuntu"
+            suites: ["{{ ansible_facts['distribution_release'] }}"]
+            components: [stable]
+            architectures: >-
+              {{ ['amd64'] if ansible_facts['architecture'] == 'x86_64'
+                 else [ansible_facts['architecture']] }}
+            signed_by: /etc/apt/keyrings/docker.asc
+            enabled: true
+            state: present
+
+        - name: Install Docker Engine
+          ansible.builtin.apt:
+            name: "{{ docker_apt_packages }}"
+            state: present
+            update_cache: true
+
+        - name: Enable and start Docker
+          ansible.builtin.systemd_service:
+            name: docker
+            enabled: true
+            state: started
+
+        - name: Add users to the docker group
+          ansible.builtin.user:
+            name: "{{ item }}"
+            groups: docker
+            append: true
+          loop: "{{ docker_group_users }}"
+
+    # -----------------------------------------------------------------------
+    - name: Resolve the video group ID
+      tags: [always]
+      block:
+        # /dev/dri/renderD* is owned by the host's `video` GID; --group-add
+        # resolves names against the container's /etc/group, so this must be
+        # passed as a number.
+        - name: Look up the video group
+          ansible.builtin.getent:
+            database: group
+            key: "{{ llama_cpp_video_gid_group }}"
+
+        - name: Record the video GID
+          ansible.builtin.set_fact:
+            llama_cpp_video_gid: "{{ ansible_facts.getent_group[llama_cpp_video_gid_group][1] }}"
+
+        - name: Grant users host-side access to the GPU device
+          ansible.builtin.user:
+            name: "{{ item }}"
+            groups: "{{ [llama_cpp_video_gid_group] }}"
+            append: true
+          loop: "{{ llama_cpp_video_group_users }}"
+          register: gpu_groups
+
+        - name: Note that group changes need a new login
+          ansible.builtin.debug:
+            msg: >-
+              Added {{ gpu_groups.results | selectattr('changed') | map(attribute='item') | join(', ') }}
+              to {{ llama_cpp_video_gid_group }}. Log out and back in for it to take effect.
+          when: gpu_groups.results | selectattr('changed') | list | length > 0
+
+    # -----------------------------------------------------------------------
+    - name: Create host directories
+      tags: [dirs]
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: matthew
+        group: matthew
+        mode: "0755"
+      loop:
+        - "{{ llama_cpp_home }}"
+        - "{{ llama_cpp_models_dir }}"
+
+    # -----------------------------------------------------------------------
+    - name: Pull the llama.cpp image
+      tags: [image]
+      block:
+        - name: Check whether the image is already present
+          ansible.builtin.command: "docker image inspect {{ llama_cpp_image_ref }}"
+          register: image_present
+          changed_when: false
+          failed_when: false
+
+        - name: Pull {{ llama_cpp_image_ref }}
+          ansible.builtin.command: "docker pull {{ llama_cpp_image_ref }}"
+          when: image_present.rc != 0
+          changed_when: true
+          timeout: 600
+          notify: Restart llama-cpp
+
+    # -----------------------------------------------------------------------
+    - name: Verify the container can reach the GPU
+      tags: [image, verify]
+      ansible.builtin.command: >-
+        docker run --rm --device /dev/dri --group-add {{ llama_cpp_video_gid }}
+        --entrypoint /app/llama-server {{ llama_cpp_image_ref }}
+        --list-devices
+      register: gpu_check
+      changed_when: false
+
+    - name: Report the detected device
+      tags: [image, verify]
+      ansible.builtin.debug:
+        msg: "container sees: {{ gpu_check.stdout_lines }}"
+
+    - name: Fail if no Vulkan device was found
+      tags: [image, verify]
+      ansible.builtin.assert:
+        that: "'(none)' not in gpu_check.stdout"
+        fail_msg: >-
+          llama-server --list-devices reported no Vulkan device. Check that
+          the amdgpu kernel driver is loaded and /dev/dri/renderD* exists.
+
+    # -----------------------------------------------------------------------
+    - name: Download model weights
+      tags: [model]
+      # A plain HTTPS GET, not huggingface_hub -- these are public files, not
+      # a repo snapshot, so there is no need for a Python environment on the
+      # host or inside a throwaway container.
+      ansible.builtin.get_url:
+        url: "{{ item.url }}"
+        dest: "{{ llama_cpp_models_dir }}/{{ item.file }}"
+        owner: matthew
+        group: matthew
+        mode: "0644"
+        timeout: 3600
+      loop:
+        - url: "{{ llama_cpp_model_url }}"
+          file: "{{ llama_cpp_model_file }}"
+        - url: "{{ llama_cpp_model_draft_url }}"
+          file: "{{ llama_cpp_model_draft_file }}"
+        - url: "{{ llama_cpp_model_mmproj_url }}"
+          file: "{{ llama_cpp_model_mmproj_file }}"
+      register: model_download
+      notify: Restart llama-cpp
+
+    # -----------------------------------------------------------------------
+    - name: Configure the systemd service
+      tags: [service]
+      block:
+        - name: Write the unit file
+          ansible.builtin.template:
+            src: llama-cpp.service.j2
+            dest: "/etc/systemd/system/{{ llama_cpp_service_name }}.service"
+            owner: root
+            group: root
+            mode: "0644"
+          notify:
+            - Reload systemd
+            - Restart llama-cpp
+
+        - name: Flush handlers so the service starts with current config
+          ansible.builtin.meta: flush_handlers
+
+        - name: Enable and start llama.cpp
+          ansible.builtin.systemd_service:
+            name: "{{ llama_cpp_service_name }}"
+            enabled: true
+            state: started
+            daemon_reload: true
+
+    # -----------------------------------------------------------------------
+    - name: Open the API port
+      tags: [firewall]
+      when: llama_cpp_manage_firewall | bool
+      block:
+        - name: Check whether ufw is present
+          ansible.builtin.command: ufw status
+          register: ufw_status
+          changed_when: false
+          failed_when: false
+
+        - name: Allow the llama.cpp port from the local network
+          community.general.ufw:
+            rule: allow
+            port: "{{ llama_cpp_port }}"
+            proto: tcp
+            src: "{{ llama_cpp_firewall_source }}"
+            comment: "llama.cpp API"
+          when: ufw_status.rc == 0 and 'inactive' not in ufw_status.stdout
+
+    # -----------------------------------------------------------------------
+    - name: Wait for the API to become healthy
+      tags: [verify]
+      block:
+        - name: Poll the health endpoint
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ llama_cpp_port }}/health"
+            status_code: 200
+          register: health
+          until: health.status == 200
+          retries: 30
+          delay: 5
+
+        - name: List the served models
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ llama_cpp_port }}/v1/models"
+            headers: "{{ {'Authorization': 'Bearer ' + llama_cpp_api_key} if llama_cpp_api_key | length > 0 else {} }}"
+            return_content: true
+          register: models
+
+        - name: Report the endpoint
+          ansible.builtin.debug:
+            msg:
+              - "llama.cpp is serving: {{ models.json.data | map(attribute='id') | join(', ') }}"
+              - "Endpoint: http://{{ ansible_host }}:{{ llama_cpp_port }}/v1"

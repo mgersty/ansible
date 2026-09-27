@@ -1,0 +1,22 @@
+[Unit]
+Description=Laya System 1 decision server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ laya_cpp_user }}
+Group={{ laya_cpp_group }}
+SupplementaryGroups=render video
+WorkingDirectory={{ laya_cpp_checkout }}
+Environment=HOME={{ '/home/' ~ laya_cpp_user }}
+{% for key, value in laya_cpp_environment.items() %}
+Environment={{ key }}={{ value | quote }}
+{% endfor %}
+ExecStart={{ laya_cpp_executable | quote }} --host {{ laya_cpp_bind_host | quote }} --port {{ laya_cpp_port }} {{ laya_cpp_server_args | map('quote') | join(' ') }}
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

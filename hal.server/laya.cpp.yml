@@ -1,0 +1,173 @@
+---
+# Build and run the general English Laya System 1 decision server from laya.cpp.
+# The host only needs the Vulkan loader/driver and build tooling; model runtime
+# and HTTP service are managed by systemd.
+- name: Build and deploy Laya on hal (Vulkan)
+  hosts: laya_cpp
+  become: true
+  gather_facts: true
+
+  vars_files:
+    - group_vars/laya_cpp.yml
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+    - name: Restart laya-cpp
+      ansible.builtin.systemd_service:
+        name: "{{ laya_cpp_service_name }}"
+        state: restarted
+
+  tasks:
+    - name: Validate target requirements
+      tags: [preflight]
+      block:
+        - name: Assert supported Ubuntu and architecture
+          ansible.builtin.assert:
+            that:
+              - ansible_facts['distribution'] == 'Ubuntu'
+              - ansible_facts['architecture'] == 'x86_64'
+            fail_msg: "laya.cpp build is configured for x86_64 Ubuntu hosts."
+
+        - name: Verify Vulkan render node
+          ansible.builtin.stat:
+            path: /dev/dri/renderD128
+          register: laya_cpp_render_node
+
+        - name: Require Vulkan render node
+          ansible.builtin.assert:
+            that: laya_cpp_render_node.stat.exists
+            fail_msg: "Missing /dev/dri/renderD128; check the host AMDGPU driver."
+
+    - name: Install build and Vulkan dependencies
+      tags: [packages]
+      ansible.builtin.apt:
+        name:
+          - git
+          - cmake
+          - ninja-build
+          - build-essential
+          - pkg-config
+          - libicu-dev
+          - nlohmann-json3-dev
+          - libvulkan-dev
+          - mesa-vulkan-drivers
+          - vulkan-tools
+          - glslc
+          - spirv-headers
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Create laya.cpp directories
+      tags: [dirs]
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ laya_cpp_user }}"
+        group: "{{ laya_cpp_group }}"
+        mode: "0755"
+      loop:
+        - "{{ laya_cpp_home }}"
+        - "{{ laya_cpp_checkout }}"
+        - "{{ laya_cpp_model_dir }}"
+        - "{{ laya_cpp_checkpoint_dir }}"
+        - "{{ laya_cpp_checkpoint_dir }}/encoder"
+        - "{{ laya_cpp_checkpoint_dir }}/tokenizer"
+
+    - name: Checkout laya.cpp source
+      tags: [source]
+      ansible.builtin.git:
+        repo: "{{ laya_cpp_repo }}"
+        dest: "{{ laya_cpp_checkout }}"
+        version: "{{ laya_cpp_version }}"
+        update: true
+        force: false
+      become_user: "{{ laya_cpp_user }}"
+      register: laya_cpp_source
+
+    - name: Configure Vulkan build
+      tags: [build]
+      ansible.builtin.command:
+        argv:
+          - cmake
+          - -S
+          - "{{ laya_cpp_checkout }}"
+          - -B
+          - "{{ laya_cpp_build_dir }}"
+          - -G
+          - Ninja
+          - -DCMAKE_BUILD_TYPE=Release
+          # Upstream laya.cpp uses LAYA_CUDA / LAYA_VULKAN (not LAYA_CPP_VULKAN).
+          - -DLAYA_CUDA=OFF
+          - -DLAYA_VULKAN=ON
+      become_user: "{{ laya_cpp_user }}"
+      register: laya_cpp_configure
+      changed_when: laya_cpp_configure.rc == 0
+
+    - name: Check whether laya.cpp executable exists
+      tags: [build]
+      ansible.builtin.stat:
+        path: "{{ laya_cpp_executable }}"
+      register: laya_cpp_executable_stat
+
+    - name: Build laya.cpp
+      tags: [build]
+      ansible.builtin.command:
+        argv:
+          - cmake
+          - --build
+          - "{{ laya_cpp_build_dir }}"
+          - --parallel
+          - "{{ laya_cpp_build_jobs | string }}"
+      become_user: "{{ laya_cpp_user }}"
+      register: laya_cpp_build
+      changed_when: laya_cpp_build.rc == 0
+      when: laya_cpp_source.changed or not laya_cpp_executable_stat.stat.exists or laya_cpp_force_build | bool
+
+    - name: Download configured model artifacts
+      tags: [model]
+      ansible.builtin.get_url:
+        url: "https://huggingface.co/{{ laya_cpp_model_repo }}/resolve/{{ laya_cpp_model_revision }}/{{ item.file }}"
+        dest: "{{ laya_cpp_checkpoint_dir }}/{{ item.file }}"
+        owner: "{{ laya_cpp_user }}"
+        group: "{{ laya_cpp_group }}"
+        mode: "0644"
+        timeout: 3600
+      loop: "{{ laya_cpp_models }}"
+      when: laya_cpp_models | length > 0
+      notify: Restart laya-cpp
+
+    - name: Install systemd service
+      tags: [service]
+      ansible.builtin.template:
+        src: laya-cpp.service.j2
+        dest: "/etc/systemd/system/{{ laya_cpp_service_name }}.service"
+        owner: root
+        group: root
+        mode: "0644"
+      notify:
+        - Reload systemd
+        - Restart laya-cpp
+
+    - name: Enable and start laya.cpp service
+      tags: [service]
+      ansible.builtin.systemd_service:
+        name: "{{ laya_cpp_service_name }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Verify the HTTP endpoint
+      tags: [verify]
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ laya_cpp_port }}{{ laya_cpp_health_path }}"
+        method: GET
+        status_code: "{{ laya_cpp_health_status }}"
+      register: laya_cpp_health
+      until: laya_cpp_health.status == laya_cpp_health_status
+      retries: 30
+      delay: 5
+      when: laya_cpp_verify_endpoint | bool

@@ -1,0 +1,84 @@
+---
+
+laya_cpp_repo: "https://github.com/lkarlslund/laya.cpp.git"
+laya_cpp_version: "main"
+
+laya_cpp_user: matthew
+laya_cpp_group: matthew
+laya_cpp_home: /opt/laya-cpp
+
+laya_cpp_checkout: "{{ laya_cpp_home }}/src"
+laya_cpp_build_dir: "{{ laya_cpp_checkout }}/build-vulkan"
+# The general English checkpoint lives directly in laya.cpp's model root.
+laya_cpp_model_dir: "{{ laya_cpp_home }}/models/laya"
+laya_cpp_checkpoint_dir: "{{ laya_cpp_model_dir }}"
+laya_cpp_model_repo: "convaiinnovations/laya"
+laya_cpp_model_revision: "55cf4c4ebb4ebe31b2550e8bdf3bd21b99753851"
+
+laya_cpp_build_jobs: 16
+laya_cpp_force_build: false
+
+laya_cpp_service_name: laya-cpp
+laya_cpp_executable: "{{ laya_cpp_build_dir }}/bin/laya-cli"
+
+laya_cpp_bind_host: 0.0.0.0
+laya_cpp_port: 8001
+
+laya_cpp_health_path: /health
+laya_cpp_health_status: 200
+laya_cpp_verify_endpoint: true
+
+laya_cpp_variant: english
+laya_cpp_model_path: "{{ laya_cpp_model_dir }}"
+
+laya_cpp_server_args:
+  - --server
+  - --port
+  - "{{ laya_cpp_port }}"
+  - --model
+  - "{{ laya_cpp_model_path }}"
+  - --variant
+  - "{{ laya_cpp_variant }}"
+  - --vulkan
+laya_cpp_environment: {}
+
+# Native checkpoint files for the general English Laya model.
+laya_cpp_models:
+  - file: model.safetensors
+  - file: rl_agent_config.json
+  - file: encoder/config.json
+  - file: tokenizer/tokenizer.json
+  - file: tokenizer/tokenizer_config.json
+
+
+
+# ---
+# # laya.cpp deployment settings. Confirm repo/CLI options against upstream before
+# # first run; keep version pinned to an immutable commit or release.
+# laya_cpp_repo: "https://github.com/lkarlslund/laya.cpp.git"
+# laya_cpp_version: "main"
+
+# laya_cpp_user: matthew
+# laya_cpp_group: matthew
+# laya_cpp_home: /opt/laya-cpp
+# laya_cpp_checkout: "{{ laya_cpp_home }}/src"
+# laya_cpp_build_dir: "{{ laya_cpp_checkout }}/build"
+# laya_cpp_model_dir: "{{ laya_cpp_home }}/models"
+# laya_cpp_build_jobs: 16
+# laya_cpp_force_build: false
+
+# laya_cpp_service_name: laya-cpp
+# laya_cpp_executable: "{{ laya_cpp_build_dir }}/laya-server"
+# laya_cpp_bind_host: 0.0.0.0
+# laya_cpp_port: 8001
+# laya_cpp_health_path: /health
+# laya_cpp_health_status: 200
+# laya_cpp_verify_endpoint: true
+# # Configure arguments to match the selected laya.cpp revision. Do not expose
+# # this service to untrusted networks; it may be unauthenticated by default.
+# laya_cpp_server_args: []
+# laya_cpp_environment: {}
+
+# # Supply the exact upstream checkpoint artifact(s) and runtime flags here.
+# # Empty by default: do not invent/assume a GGUF file format or model CLI.
+# laya_cpp_models: []

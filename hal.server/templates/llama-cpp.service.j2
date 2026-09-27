@@ -1,0 +1,50 @@
+{{ ansible_managed | comment }}
+[Unit]
+Description=llama.cpp OpenAI-compatible API server ({{ llama_cpp_served_model_name }}, Vulkan)
+Documentation=https://github.com/ggml-org/llama.cpp
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStartPre=-/usr/bin/docker rm -f {{ llama_cpp_container_name }}
+
+ExecStart=/usr/bin/docker run --rm --name {{ llama_cpp_container_name }} \
+    --device /dev/dri \
+    --group-add {{ llama_cpp_video_gid }} \
+    --publish {{ llama_cpp_bind_host }}:{{ llama_cpp_port }}:8080 \
+    --volume {{ llama_cpp_models_dir }}:{{ llama_cpp_container_models_dir }} \
+    {{ llama_cpp_image_ref }} \
+    --model {{ llama_cpp_container_models_dir }}/{{ llama_cpp_model_file }} \
+{% if llama_cpp_model_draft_file | default('') | length > 0 %}    --model-draft {{ llama_cpp_container_models_dir }}/{{ llama_cpp_model_draft_file }} \
+    --spec-type draft-mtp \
+    --spec-draft-n-max {{ llama_cpp_spec_draft_n_max }} \
+{% endif %}{% if llama_cpp_model_mmproj_file | default('') | length > 0 %}    --mmproj {{ llama_cpp_container_models_dir }}/{{ llama_cpp_model_mmproj_file }} \
+{% endif %}    --alias {{ llama_cpp_served_model_name }} \
+    --host 0.0.0.0 \
+    --port 8080 \
+    --ctx-size {{ llama_cpp_ctx_size }} \
+    --gpu-layers {{ llama_cpp_gpu_layers }} \
+    --flash-attn {{ llama_cpp_flash_attn }} \
+    --reasoning-format {{ llama_cpp_reasoning_format }}{% if llama_cpp_api_key | length > 0 %} \
+    --api-key {{ llama_cpp_api_key }}{% endif %}{% for arg in llama_cpp_extra_args %} \
+    {{ arg }}{% endfor %}
+
+
+ExecStop=/usr/bin/docker stop --time 30 {{ llama_cpp_container_name }}
+
+# llama.cpp loads in seconds (no torch.compile/CUDA-graph warmup like vLLM),
+# so this does not need vLLM's 1800s allowance -- 300s is generous headroom
+# for a cold model-weight read from disk.
+TimeoutStartSec=300
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=15
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier={{ llama_cpp_service_name }}
+
+[Install]
+WantedBy=multi-user.target

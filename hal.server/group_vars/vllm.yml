@@ -59,30 +59,53 @@ vllm_host_gpu_tools:
   - nvtop
 
 # --- Model ----------------------------------------------------------------
-# AWQ 4-bit with group_size=128. That combination is load-bearing on gfx1151;
-# the more obvious choices all fail to start:
+# amd/Qwen3.8-27B-Quark-AWQ-MXFP4: AMD's own Quark-toolkit quant of the 27B
+# dense, natively-multimodal Qwen3.8 (architecture Qwen3_5ForConditionalGeneration
+# -- built on the Qwen3.5 codebase, which this vLLM (0.19.1+rocm7.13.0rc2)
+# already has registered, so no image bump was needed to load it).
 #
+# KNOWN PERFORMANCE ISSUE: gfx1151 has no native MXFP4 compute path. vLLM logs
+# "QuarkOCP_MX is not supported on the current platform" and
+# "The current platform does not support native MXFP4/MXFP6 computation.
+# Simulated weight dequantization ... will be used, with the linear layers
+# computed in high precision" -- i.e. you get the 4-bit memory footprint but
+# NOT an accelerated kernel. Measured on hal: ~1.9 tokens/s generation, vs
+# ~19.6 tokens/s for the previous ELVISIO AWQ (awq_marlin, real INT4 kernel)
+# 30B model. That is a ~10x regression and this config should be treated as
+# provisional until it is replaced with a real-kernel quant.
+#
+# Next step to try: barrydeen/Qwen3.8-27B-AWQ-4bit (plain AWQ W4A16, not
+# MXFP4) -- check its config.json `group_size` against the awq_marlin
+# constraint noted below before switching.
+#
+# Unrelated background, still true for any future AWQ candidate on gfx1151:
 #   Qwen/...-FP8            block-scaled FP8 (128x128); no FP8 MoE backend on
 #                           ROCm implements block scales, so the engine refuses
 #                           to start with "No FP8 MoE backend supports ...".
 #   cyankiwi/...-AWQ-4bit   AWQ but group_size=32; ConchLinearKernel supports
 #                           only [-1, 128], so no WNA16 kernel can be found.
-#   BF16                    ~61 GB of weights; will not fit in 64 GiB with a
-#                           usable KV cache.
+#   BF16                    ~56 GB of weights for a 27B dense model; will not
+#                           fit in 64 GiB with a usable KV cache.
 #
-# ALWAYS check `group_size` in the repo's config.json before switching models.
+# ALWAYS check `group_size` in the repo's config.json before switching to an
+# AWQ candidate.
 #
-# Measured on hal with the sibling ELVISIO/Qwen3-30B-A3B-Instruct-2507-AWQ
-# (same architecture and quantisation): 15.87 GiB of weights, 40.83 GiB KV cache
-# free (445,984 tokens), engine init 7.4 s. This Coder repo was verified to
-# select the awq_marlin kernel on gfx1151. See README.md before changing this.
-vllm_model: "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ"
-vllm_served_model_name: "qwen3-coder-30b"
-# The model's native context is 262144. Measured KV cache on hal is 40.83 GiB
-# = 445,984 tokens (~96 KiB/token: 48 layers x 4 KV heads x 128 dim x 2 x 2 B),
-# so a 131072-token sequence costs ~12 GiB and three can be resident at once.
-# Raised from 32768 because coding agents burn context fast.
-vllm_max_model_len: 131072
+# Measured on hal with this repo: 17.83 GiB of weights, 36.68 GiB KV cache
+# free. See README.md before changing this.
+#
+# Prior model: ELVISIO/Qwen3-30B-A3B-Instruct-2507-AWQ (served as qwen3-30b,
+# max_model_len 131072, awq_marlin, ~19.6 tok/s). Its weights are still cached
+# under /opt/vllm/models/hub if you need to roll back -- but the tool-call
+# parser and --reasoning-parser below must move with it (that model did not
+# need --reasoning-parser or --trust-remote-code).
+vllm_model: "amd/Qwen3.8-27B-Quark-AWQ-MXFP4"
+vllm_served_model_name: "qwen3.8-27b"
+# The model's native context is 262144 (extendable to 1M via YaRN). Only 16 of
+# 64 decoder layers use full attention (the rest are Gated DeltaNet linear
+# attention with ~constant per-sequence state), which is why the measured KV
+# cache pool (36.68 GiB) supports the full native context at all: vLLM reports
+# 2.25x concurrency at 262144 tokens/request, much higher for shorter requests.
+vllm_max_model_len: 262144
 vllm_gpu_memory_utilization: 0.90
 vllm_dtype: auto
 
@@ -109,13 +132,29 @@ vllm_api_key: ""
 # The parser must match the model's tool-call format: `qwen3_coder` for
 # Qwen3-Coder, `hermes` for Qwen3 Instruct. Changing the model without changing
 # this yields empty tool_calls with the call rendered as text in content.
+#
+# --reasoning-parser qwen3: this model is a hybrid thinking/non-thinking model
+# and emits a `</think>` marker in its output (registered vLLM parser name is
+# "qwen3" -- see vllm.reasoning.qwen3_reasoning_parser.Qwen3ReasoningParser,
+# which explicitly documents handling the Qwen3/Qwen3.5 family, which this
+# model's architecture is built on). Without this flag the thinking trace
+# lands inline in `content` instead of the separate `reasoning` field.
+#
+# --trust-remote-code: required by this repo's model card; harmless no-op if
+# a future model does not need it.
+#
+# --max-num-seqs deliberately omitted (unlike the prior 30B config): with
+# max_model_len raised to the model's full 262144, letting vLLM size
+# concurrency from the actual KV cache budget makes more sense than a fixed
+# low cap.
 vllm_extra_args:
-  - "--max-num-seqs"
-  - "8"
+  - "--trust-remote-code"
   - "--enable-prefix-caching"
   - "--enable-auto-tool-choice"
   - "--tool-call-parser"
-  - "qwen3_coder"
+  - "hermes"
+  - "--reasoning-parser"
+  - "qwen3"
 
 # --- Container runtime flags ----------------------------------------------
 # vLLM's engine leans on shared memory heavily; --ipc host is what AMD documents.
@@ -160,6 +199,6 @@ vllm_firewall_source: "10.1.1.0/24"
 # that are actually still missing, so re-runs after a successful pull do not
 # fail on space the pull itself consumed.
 vllm_image_disk_gb: 47
-# AWQ 4-bit weights are ~17 GB on disk (vs ~32 GB for the FP8 repo).
+# amd/Qwen3.8-27B-Quark-AWQ-MXFP4 weights are ~19 GB on disk.
 vllm_model_disk_gb: 20
 vllm_disk_headroom_gb: 10
