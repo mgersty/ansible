@@ -1,6 +1,6 @@
 # laya-cpp container
 
-Builds laya.cpp and serves the pinned English Laya checkpoint on port
+Builds laya.cpp and serves the pinned typed-decisions Laya checkpoint on port
 **8001** (same port as the native `laya-cpp` systemd service in this repo,
 so the two are drop-in alternatives — don't run both at once).
 
@@ -18,8 +18,9 @@ docker build -t laya-cpp files/laya-cpp
 The image is compiled for **the machine's own architecture**, so on Apple
 Silicon a plain `docker build` produces a native arm64 image that runs
 without emulation. The build compiles `laya-cli` from source and downloads
-the English checkpoint (~843 MB) from `convaiinnovations/laya` into the
-image, so `docker run` needs no further setup.
+the typed-decisions checkpoint (~843 MB) from
+`convaiinnovations/laya-typed-decisions` into the image, so `docker run`
+needs no further setup.
 
 Variants:
 

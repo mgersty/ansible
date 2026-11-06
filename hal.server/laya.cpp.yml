@@ -129,12 +129,16 @@
 
     - name: Download configured model artifacts
       tags: [model]
+      # checksum= makes re-runs idempotent and safe: the new variant's
+      # model.safetensors is downloaded to a temp file and renamed over the
+      # old one, so an interrupted download can never corrupt the live file.
       ansible.builtin.get_url:
         url: "https://huggingface.co/{{ laya_cpp_model_repo }}/resolve/{{ laya_cpp_model_revision }}/{{ item.file }}"
         dest: "{{ laya_cpp_checkpoint_dir }}/{{ item.file }}"
         owner: "{{ laya_cpp_user }}"
         group: "{{ laya_cpp_group }}"
         mode: "0644"
+        checksum: url
         timeout: 3600
       loop: "{{ laya_cpp_models }}"
       when: laya_cpp_models | length > 0

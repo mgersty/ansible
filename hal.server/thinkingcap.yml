@@ -1,0 +1,241 @@
+---
+# Install bottlecapai/ThinkingCap-Qwen3.8-27B-GGUF on hal, served by
+# llama.cpp (ROCm/HIP) in Docker -- the same stack as llama-cpp.yml, but a
+# separate container/service so the unsloth Qwen3.8-27B-UD-Q8_K_XL deployment
+# keeps running untouched on :8000.
+#
+#   ansible-playbook thinkingcap.yml -K
+#
+# The model is a vision-language model (27B dense, Qwen3.8-based finetune), so
+# the play downloads the Q8_0 weights plus the f16 mmproj projector. The
+# repo's MTP head is embedded in the main GGUF (self-speculative decoding via
+# --spec-type draft-mtp), not a separate file -- unlike unsloth's split
+# mtp-Qwen3.8-27B-Q4_0.gguf, so no draft file is downloaded.
+#
+# Q8_0 (about 29 GB) is selected for this deployment. The card has 64 GiB of
+# VRAM, and the other Q8 model occupies about 31.5 GB at runtime; running both
+# concurrently leaves limited room for KV caches. Reassess context size and
+# memory headroom before serving both models at the same time.
+
+- name: Deploy ThinkingCap-Qwen3.8-27B-GGUF on gfx1151 (ROCm/HIP)
+  hosts: llama_cpp
+  become: true
+  gather_facts: true
+
+  vars:
+    tc_container_name: thinkingcap
+    tc_service_name: thinkingcap
+    tc_image_ref: "{{ llama_cpp_image_ref }}"
+    tc_models_dir: "{{ llama_cpp_models_dir }}/thinkingcap"
+    tc_container_models_dir: /models
+
+    tc_model_repo: "bottlecapai/ThinkingCap-Qwen3.8-27B-GGUF"
+    tc_model_file: "ThinkingCap-Qwen3.8-27B-Q8_0.gguf"
+
+    tc_model_url: "https://huggingface.co/{{ tc_model_repo }}/resolve/main/{{ tc_model_file }}"
+    tc_model_mmproj_file: "mmproj-ThinkingCap-Qwen3.8-27B-f16.gguf"
+    tc_model_mmproj_url: "https://huggingface.co/{{ tc_model_repo }}/resolve/main/{{ tc_model_mmproj_file }}"
+
+    tc_served_model_name: "thinkingcap-27b"
+    tc_port: 8010
+    tc_api_key: ""
+    tc_ctx_size: 262144
+    tc_flash_attn: "auto"
+    tc_reasoning_format: "deepseek"
+    # Self-speculative decoding with the MTP head embedded in the GGUF.
+    tc_spec_draft_n_max: 3
+
+    # Image is shared with llama-cpp.yml, so reuse its estimate.
+    tc_image_disk_gb: "{{ llama_cpp_image_disk_gb }}"
+    # Q8_0 about 29 GB + mmproj 0.931 GB, rounded up.
+    tc_model_disk_gb: 31
+    tc_disk_headroom_gb: 10
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+    - name: Restart thinkingcap
+      ansible.builtin.systemd_service:
+        name: "{{ tc_service_name }}"
+        state: restarted
+
+  tasks:
+    # -----------------------------------------------------------------------
+    - name: Preflight
+      tags: [preflight]
+      block:
+        - name: Check free disk space
+          ansible.builtin.set_fact:
+            tc_free_gb: >-
+              {{ (ansible_facts['mounts']
+                  | selectattr('mount', 'equalto', '/')
+                  | map(attribute='size_available')
+                  | first / 1073741824) | round(1) }}
+
+        - name: Check whether the image is already pulled
+          ansible.builtin.command: "docker image inspect {{ tc_image_ref }}"
+          register: tc_image
+          changed_when: false
+          failed_when: false
+
+        - name: Check whether the target model is already downloaded
+          ansible.builtin.stat:
+            path: "{{ tc_models_dir }}/{{ tc_model_file }}"
+          register: tc_weights
+
+        - name: Check whether the vision mmproj file is already downloaded
+          ansible.builtin.stat:
+            path: "{{ tc_models_dir }}/{{ tc_model_mmproj_file }}"
+          register: tc_mmproj
+
+        - name: Compute the space still required
+          ansible.builtin.set_fact:
+            tc_required_gb: >-
+              {{ ((tc_image_disk_gb if tc_image.rc | default(1) != 0 else 0)
+                  + (tc_model_disk_gb
+                     if not (tc_weights.stat.exists and tc_mmproj.stat.exists)
+                     else 0)
+                  + tc_disk_headroom_gb) | float }}
+
+        - name: Fail if the disk cannot hold what is still missing
+          ansible.builtin.assert:
+            that: tc_free_gb | float >= tc_required_gb | float
+            fail_msg: >-
+              Only {{ tc_free_gb }} GB free on / but {{ tc_required_gb }} GB
+              is still required
+              ({{ 'image ' ~ tc_image_disk_gb ~ ' GB' if tc_image.rc | default(1) != 0 else 'image already pulled' }};
+              {{ 'ThinkingCap weights ' ~ tc_model_disk_gb ~ ' GB'
+                 if not (tc_weights.stat.exists and tc_mmproj.stat.exists)
+                 else 'ThinkingCap weights already present' }};
+              headroom {{ tc_disk_headroom_gb }} GB).
+              sudo lvextend -l +100%FREE /dev/ubuntu-vg/ubuntu-lv && sudo resize2fs /dev/ubuntu-vg/ubuntu-lv
+            success_msg: >-
+              {{ tc_free_gb }} GB free, {{ tc_required_gb }} GB still required.
+
+    # -----------------------------------------------------------------------
+    - name: Create the model directory
+      tags: [dirs]
+      ansible.builtin.file:
+        path: "{{ tc_models_dir }}"
+        state: directory
+        owner: matthew
+        group: matthew
+        mode: "0755"
+
+    # -----------------------------------------------------------------------
+    - name: Download the ThinkingCap weights
+      tags: [model]
+      ansible.builtin.get_url:
+        url: "{{ item.url }}"
+        dest: "{{ tc_models_dir }}/{{ item.file }}"
+        owner: matthew
+        group: matthew
+        mode: "0644"
+        timeout: 3600
+        force: false
+      loop:
+        - url: "{{ tc_model_url }}"
+          file: "{{ tc_model_file }}"
+        - url: "{{ tc_model_mmproj_url }}"
+          file: "{{ tc_model_mmproj_file }}"
+      register: tc_download
+      notify: Restart thinkingcap
+
+    # -----------------------------------------------------------------------
+    - name: Resolve the ROCm device group IDs
+      tags: [preflight, service]
+      block:
+        - name: Verify ROCm device nodes exist
+          ansible.builtin.stat:
+            path: "{{ item }}"
+          loop:
+            - /dev/kfd
+            - "{{ llama_cpp_render_node }}"
+          register: tc_rocm_device_nodes
+
+        - name: Fail if ROCm device nodes are missing
+          ansible.builtin.assert:
+            that: tc_rocm_device_nodes.results | map(attribute='stat.exists') | min
+            fail_msg: >-
+              ROCm requires /dev/kfd and {{ llama_cpp_render_node }}. Verify
+              the amdgpu driver and host ROCm setup.
+
+        # Read the numeric GIDs directly from device ownership. This avoids
+        # relying on getent's nested fact layout or host group names in Docker.
+        - name: Record ROCm device GIDs
+          ansible.builtin.set_fact:
+            tc_device_gids: >-
+              {{ [tc_rocm_device_nodes.results[0].stat.gid,
+                  tc_rocm_device_nodes.results[1].stat.gid] | unique }}
+
+    # -----------------------------------------------------------------------
+    - name: Configure the systemd service
+      tags: [service]
+      block:
+        - name: Write the unit file
+          ansible.builtin.template:
+            src: thinkingcap.service.j2
+            dest: "/etc/systemd/system/{{ tc_service_name }}.service"
+            owner: root
+            group: root
+            mode: "0644"
+          notify:
+            - Reload systemd
+            - Restart thinkingcap
+
+        - name: Flush handlers so the service starts with current config
+          ansible.builtin.meta: flush_handlers
+
+        - name: Enable and start thinkingcap
+          ansible.builtin.systemd_service:
+            name: "{{ tc_service_name }}"
+            enabled: true
+            state: started
+            daemon_reload: true
+
+    # -----------------------------------------------------------------------
+    - name: Open the API port
+      tags: [firewall]
+      block:
+        - name: Check whether ufw is present
+          ansible.builtin.command: ufw status
+          register: tc_ufw_status
+          changed_when: false
+          failed_when: false
+
+        - name: Allow the ThinkingCap port from the local network
+          community.general.ufw:
+            rule: allow
+            port: "{{ tc_port }}"
+            proto: tcp
+            src: "{{ llama_cpp_firewall_source }}"
+            comment: "thinkingcap API"
+          when: tc_ufw_status.rc == 0 and 'inactive' not in tc_ufw_status.stdout
+
+    # -----------------------------------------------------------------------
+    - name: Wait for the API to become healthy
+      tags: [verify]
+      block:
+        - name: Poll the health endpoint
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ tc_port }}/health"
+            status_code: 200
+          register: tc_health
+          until: tc_health.status == 200
+          retries: 30
+          delay: 5
+
+        - name: List the served models
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ tc_port }}/v1/models"
+            headers: "{{ {'Authorization': 'Bearer ' + tc_api_key} if tc_api_key | length > 0 else {} }}"
+            return_content: true
+          register: tc_models
+
+        - name: Report the endpoint
+          ansible.builtin.debug:
+            msg:
+              - "thinkingcap is serving: {{ tc_models.json.data | map(attribute='id') | join(', ') }}"
+              - "Endpoint: http://{{ ansible_host }}:{{ tc_port }}/v1"

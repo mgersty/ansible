@@ -1,0 +1,83 @@
+---
+# ---------------------------------------------------------------------------
+# KnowLine-4B-Gen5.5 -- S1MB-rank-16 open decision model (best open model under
+# ~5B; Task Avg 67.0 on the S1MB English v1 leaderboard, where convaiinnovations/
+# laya "english" sits at 13.4). Fine-tune of Qwen3.5-4B (hybrid
+# linear/full-attention, multimodal), Apache-2.0.
+#
+# Runs as a SECOND llama.cpp container on hal, side by side with the
+# llama_cpp role (Qwen3.8-27B on :8000). Same Docker image, same ROCm/HIP
+# device passthrough; the container serves the GGUF on :8002.
+#
+# Quant choice: Q4_K_S (2.5 GB) instead of Q4_K_M (2.65 GB) -- decision
+# workloads are latency-sensitive one-shot classifications, and the extra
+# 150 MB of M-quant quality is not worth it on this memory-bandwidth-bound
+# box. Trade up to Q4_K_M if quality matters more than speed.
+#
+# The base model is a vision model (mmproj files exist), but S1MB text results
+# were produced without the vision tower, so the mmproj is NOT downloaded by
+# default. Set knowline_model_mmproj_file to "mmproj-Q8_0.gguf" to enable
+# image input.
+#
+#   ansible-playbook knowline.yml -K
+# ---------------------------------------------------------------------------
+
+# --- Image ------------------------------------------------------------------
+# Shared with the llama_cpp role: same ROCm/HIP server image.
+knowline_image_ref: "{{ llama_cpp_image_ref | default('ghcr.io/ggml-org/llama.cpp:server-rocm') }}"
+
+# --- Host paths and service identity -----------------------------------------
+knowline_user: matthew
+knowline_group: matthew
+knowline_home: /opt/knowline
+knowline_models_dir: "{{ knowline_home }}/models"
+knowline_container_models_dir: /models
+knowline_container_name: knowline
+knowline_service_name: knowline
+knowline_container_port: 8080
+
+# --- Host-side GPU access ------------------------------------------------------
+# Mirrors the llama_cpp role; same AMD Strix Halo box.
+knowline_render_node: /dev/dri/renderD128
+knowline_device_groups:
+  - render
+  - video
+knowline_device_group_users:
+  - matthew
+
+# --- Model ---------------------------------------------------------------------
+# https://huggingface.co/mradermacher/KnowLine-4B-Gen5.5-GGUF (Apache-2.0)
+knowline_model_repo: "mradermacher/KnowLine-4B-Gen5.5-GGUF"
+knowline_model_file: "KnowLine-4B-Gen5.5.Q4_K_S.gguf"
+knowline_model_url: "https://huggingface.co/{{ knowline_model_repo }}/resolve/main/{{ knowline_model_file }}"
+# Optional vision projector (empty = text-only, matches the S1MB text scope).
+knowline_model_mmproj_file: ""
+knowline_model_mmproj_url: "https://huggingface.co/{{ knowline_model_repo }}/resolve/main/mmproj-Q8_0.gguf"
+# Served model id (OpenAI `model` field).
+knowline_served_model_name: "knowline-4b"
+# Decision prompts are short; 8k is plenty and keeps KV small.
+knowline_ctx_size: 8192
+knowline_gpu_layers: "all"
+# Decision output should be short and deterministic-ish: low temp. These are
+# appended verbatim in the unit template. Note: llama-server has no
+# server-level max-output flag (--max is llama-cli only), so cap output with
+# "max_tokens" in each API request (e.g. 256 for choice questions).
+knowline_extra_args:
+  - "--temp"
+  - "0.1"
+  - "--top-k"
+  - "1"
+
+# --- Server --------------------------------------------------------------------
+knowline_bind_host: "0.0.0.0"
+knowline_port: 8002
+knowline_api_key: ""
+
+# --- Preflight -------------------------------------------------------------------
+# Q4_K_S is 2.5 GB; image already pulled by the llama_cpp role.
+knowline_model_disk_gb: 3
+knowline_disk_headroom_gb: 2
+
+# Open the API port with ufw, if ufw is installed and active.
+knowline_manage_firewall: true
+knowline_firewall_source: "10.1.1.0/24"

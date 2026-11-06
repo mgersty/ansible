@@ -91,9 +91,13 @@ COPY --from=builder /src/repo/build/bin/laya-cli /usr/local/bin/laya-cli
 COPY entrypoint.sh /usr/local/bin/laya-entrypoint
 RUN chmod 0755 /usr/local/bin/laya-entrypoint
 
-# English checkpoint from convaiinnovations/laya, pinned to the same
-# revision the ansible playbook downloads.
-ARG LAYA_MODEL_REVISION=55cf4c4ebb4ebe31b2550e8bdf3bd21b99753851
+# typed-decisions checkpoint from convaiinnovations/laya-typed-decisions,
+# pinned to the same revision the ansible playbook downloads. Retired 2026-11-04:
+# the english checkpoint (convaiinnovations/laya @ 55cf4c4e) scored near floor
+# on S1MB's laya--typed-decisions-* tasks; typed-decisions is ~10-20x better
+# there. Same ModernBERT-large encoder, so no build changes.
+ARG LAYA_MODEL_REPO=convaiinnovations/laya-typed-decisions
+ARG LAYA_MODEL_REVISION=e929ae5cf69bc34259cd2f95c9e91145b818b1f0
 ENV LAYA_MODEL_DIR=/models/laya
 
 RUN mkdir -p "${LAYA_MODEL_DIR}/encoder" "${LAYA_MODEL_DIR}/tokenizer" \
@@ -106,9 +110,9 @@ RUN mkdir -p "${LAYA_MODEL_DIR}/encoder" "${LAYA_MODEL_DIR}/tokenizer" \
            tokenizer/tokenizer_config.json; do \
          curl --fail --location --retry 3 \
              -o "$f" \
-             "https://huggingface.co/convaiinnovations/laya/resolve/${LAYA_MODEL_REVISION}/$f"; \
+             "https://huggingface.co/${LAYA_MODEL_REPO}/resolve/${LAYA_MODEL_REVISION}/$f"; \
        done \
-    && printf '%s\n' "${LAYA_MODEL_REVISION}" > "${LAYA_MODEL_DIR}/REVISION"
+    && printf '%s %s\n' "${LAYA_MODEL_REPO}" "${LAYA_MODEL_REVISION}" > "${LAYA_MODEL_DIR}/REVISION"
 
 EXPOSE 8001
 

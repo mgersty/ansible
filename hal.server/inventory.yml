@@ -20,6 +20,11 @@ all:
         hal:
           ansible_host: 10.1.1.105
           ansible_user: matthew
+    knowline:
+      hosts:
+        hal:
+          ansible_host: 10.1.1.105
+          ansible_user: matthew
     trocr:
       hosts:
         hal:

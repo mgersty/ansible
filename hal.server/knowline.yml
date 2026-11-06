@@ -1,0 +1,254 @@
+---
+# Run KnowLine-4B-Gen5.5 (S1MB rank-16 open decision model) as a SECOND
+# llama.cpp container on hal, alongside the llama_cpp role (Qwen3.8-27B on
+# :8000). Same Docker image and ROCm/HIP device passthrough; this service
+# publishes :8002.
+#
+#   ansible-playbook knowline.yml -K
+
+- name: Deploy KnowLine-4B-Gen5.5 decision model on hal (ROCm/HIP)
+  hosts: knowline
+  become: true
+  gather_facts: true
+
+  vars_files:
+    - group_vars/knowline.yml
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+    - name: Restart knowline
+      ansible.builtin.systemd_service:
+        name: "{{ knowline_service_name }}"
+        state: restarted
+
+  tasks:
+    # -----------------------------------------------------------------------
+    - name: Preflight
+      tags: [preflight]
+      block:
+        - name: Validate target architecture
+          ansible.builtin.assert:
+            that:
+              - ansible_facts['distribution'] == 'Ubuntu'
+              - ansible_facts['architecture'] == 'x86_64'
+            fail_msg: "knowline deployment is configured for x86_64 Ubuntu hosts."
+
+        - name: Verify ROCm device nodes exist
+          ansible.builtin.stat:
+            path: "{{ item }}"
+          loop:
+            - /dev/kfd
+            - "{{ knowline_render_node }}"
+          register: rocm_device_nodes
+
+        - name: Fail if ROCm device nodes are missing
+          ansible.builtin.assert:
+            that: rocm_device_nodes.results | map(attribute='stat.exists') | min
+            fail_msg: >-
+              ROCm requires /dev/kfd and {{ knowline_render_node }}. Verify
+              the amdgpu driver and host ROCm setup.
+
+        - name: Check whether the image is already pulled
+          ansible.builtin.command: "docker image inspect {{ knowline_image_ref }}"
+          register: preflight_image
+          changed_when: false
+          failed_when: false
+
+        - name: Check whether the target model is already downloaded
+          ansible.builtin.stat:
+            path: "{{ knowline_models_dir }}/{{ knowline_model_file }}"
+          register: preflight_target_weights
+
+        - name: Check whether the vision mmproj file is already downloaded
+          ansible.builtin.stat:
+            path: "{{ knowline_models_dir }}/{{ knowline_model_mmproj_file }}"
+          register: preflight_mmproj_weights
+          when: knowline_model_mmproj_file | length > 0
+
+        - name: Compute the space still required
+          ansible.builtin.set_fact:
+            knowline_required_gb: >-
+              {{ ( ((knowline_image_disk_gb | default(2))
+                     if (preflight_image.rc | default(1)) != 0 else 0)
+                   + (knowline_model_disk_gb
+                     if (not preflight_target_weights.stat.exists
+                         or ((knowline_model_mmproj_file | length) > 0
+                             and not (preflight_mmproj_weights.stat.exists | default(false))))
+                     else 0)
+                   + knowline_disk_headroom_gb ) | float }}
+
+        - name: Check free disk space
+          ansible.builtin.set_fact:
+            knowline_free_gb: >-
+              {{ (ansible_facts['mounts']
+                  | selectattr('mount', 'equalto', '/')
+                  | map(attribute='size_available')
+                  | first / 1073741824) | round(1) }}
+
+        - name: Fail if the disk cannot hold what is still missing
+          ansible.builtin.assert:
+            that: knowline_free_gb | float >= knowline_required_gb | float
+            fail_msg: >-
+              Only {{ knowline_free_gb }} GB free on / but {{ knowline_required_gb }} GB
+              is still required.
+              sudo lvextend -l +100%FREE /dev/ubuntu-vg/ubuntu-lv && sudo resize2fs /dev/ubuntu-vg/ubuntu-lv
+            success_msg: >-
+              {{ knowline_free_gb }} GB free, {{ knowline_required_gb }} GB still required.
+
+    # -----------------------------------------------------------------------
+    - name: Resolve the ROCm device group IDs
+      tags: [preflight, service, verify]
+      block:
+        # Docker --group-add needs numeric GIDs, not host group names.
+        - name: Stat ROCm device nodes for group IDs
+          ansible.builtin.stat:
+            path: "{{ item }}"
+          loop:
+            - /dev/kfd
+            - "{{ knowline_render_node }}"
+          register: knowline_rocm_device_nodes
+
+        - name: Record ROCm device GIDs
+          ansible.builtin.set_fact:
+            knowline_device_gids: >-
+              {{ [knowline_rocm_device_nodes.results[0].stat.gid,
+                  knowline_rocm_device_nodes.results[1].stat.gid] | unique }}
+
+        - name: Grant users host-side access to the GPU device
+          ansible.builtin.user:
+            name: "{{ item }}"
+            groups: "{{ knowline_device_groups | join(',') }}"
+            append: true
+          loop: "{{ knowline_device_group_users }}"
+
+    # -----------------------------------------------------------------------
+    - name: Create host directories
+      tags: [dirs]
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ knowline_user }}"
+        group: "{{ knowline_group }}"
+        mode: "0755"
+      loop:
+        - "{{ knowline_home }}"
+        - "{{ knowline_models_dir }}"
+
+    # -----------------------------------------------------------------------
+    - name: Pull the llama.cpp image
+      tags: [image]
+      block:
+        - name: Check whether the image is already present
+          ansible.builtin.command: "docker image inspect {{ knowline_image_ref }}"
+          register: image_present
+          changed_when: false
+          failed_when: false
+
+        - name: Pull {{ knowline_image_ref }}
+          ansible.builtin.command: "docker pull {{ knowline_image_ref }}"
+          when: image_present.rc != 0
+          changed_when: true
+          timeout: 600
+          notify: Restart knowline
+
+    # -----------------------------------------------------------------------
+    - name: Download model weights
+      tags: [model]
+      # Plain HTTPS GETs for public files; no huggingface_hub on the host.
+      block:
+        - name: Download the GGUF weights
+          ansible.builtin.get_url:
+            url: "{{ knowline_model_url }}"
+            dest: "{{ knowline_models_dir }}/{{ knowline_model_file }}"
+            owner: "{{ knowline_user }}"
+            group: "{{ knowline_group }}"
+            mode: "0644"
+            timeout: 3600
+          register: model_download
+          notify: Restart knowline
+
+        - name: Download the vision mmproj (optional)
+          ansible.builtin.get_url:
+            url: "{{ knowline_model_mmproj_url }}"
+            dest: "{{ knowline_models_dir }}/{{ knowline_model_mmproj_file }}"
+            owner: "{{ knowline_user }}"
+            group: "{{ knowline_group }}"
+            mode: "0644"
+            timeout: 3600
+          when: knowline_model_mmproj_file | length > 0
+          register: mmproj_download
+          notify: Restart knowline
+
+    # -----------------------------------------------------------------------
+    - name: Configure the systemd service
+      tags: [service]
+      block:
+        - name: Write the unit file
+          ansible.builtin.template:
+            src: knowline.service.j2
+            dest: "/etc/systemd/system/{{ knowline_service_name }}.service"
+            owner: root
+            group: root
+            mode: "0644"
+          notify:
+            - Reload systemd
+            - Restart knowline
+
+        - name: Flush handlers so the service starts with current config
+          ansible.builtin.meta: flush_handlers
+
+        - name: Enable and start knowline
+          ansible.builtin.systemd_service:
+            name: "{{ knowline_service_name }}"
+            enabled: true
+            state: started
+            daemon_reload: true
+
+    # -----------------------------------------------------------------------
+    - name: Open the API port
+      tags: [firewall]
+      when: knowline_manage_firewall | bool
+      block:
+        - name: Check whether ufw is present
+          ansible.builtin.command: ufw status
+          register: ufw_status
+          changed_when: false
+          failed_when: false
+
+        - name: Allow the knowline port from the local network
+          community.general.ufw:
+            rule: allow
+            port: "{{ knowline_port }}"
+            proto: tcp
+            src: "{{ knowline_firewall_source }}"
+            comment: "knowline decision-model API"
+          when: ufw_status.rc == 0 and 'inactive' not in ufw_status.stdout
+
+    # -----------------------------------------------------------------------
+    - name: Wait for the API to become healthy
+      tags: [verify]
+      block:
+        - name: Poll the health endpoint
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ knowline_port }}/health"
+            status_code: 200
+          register: health
+          until: health.status == 200
+          retries: 30
+          delay: 5
+
+        - name: List the served models
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ knowline_port }}/v1/models"
+            headers: "{{ {'Authorization': 'Bearer ' + knowline_api_key} if knowline_api_key | length > 0 else {} }}"
+            return_content: true
+          register: models
+
+        - name: Report the endpoint
+          ansible.builtin.debug:
+            msg:
+              - "knowline is serving: {{ models.json.data | map(attribute='id') | join(', ') }}"
+              - "Endpoint: http://{{ ansible_host }}:{{ knowline_port }}/v1"

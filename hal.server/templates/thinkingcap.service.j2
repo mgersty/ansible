@@ -1,0 +1,46 @@
+{{ ansible_managed | comment }}
+[Unit]
+Description=llama.cpp OpenAI-compatible API server ({{ tc_served_model_name }}, ROCm/HIP)
+Documentation=https://github.com/ggml-org/llama.cpp
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStartPre=-/usr/bin/docker rm -f {{ tc_container_name }}
+
+ExecStart=/usr/bin/docker run --rm --name {{ tc_container_name }} \
+    --device /dev/kfd \
+    --device {{ llama_cpp_render_node }} \
+{% for gid in tc_device_gids %}    --group-add {{ gid }} \
+{% endfor %}    --publish {{ llama_cpp_bind_host }}:{{ tc_port }}:8080 \
+    --volume {{ tc_models_dir }}:{{ tc_container_models_dir }} \
+    {{ tc_image_ref }} \
+    --model {{ tc_container_models_dir }}/{{ tc_model_file }} \
+    --mmproj {{ tc_container_models_dir }}/{{ tc_model_mmproj_file }} \
+    --spec-type draft-mtp \
+    --spec-draft-n-max {{ tc_spec_draft_n_max }} \
+    --alias {{ tc_served_model_name }} \
+    --host 0.0.0.0 \
+    --port 8080 \
+    --ctx-size {{ tc_ctx_size }} \
+    --gpu-layers {{ llama_cpp_gpu_layers }} \
+    --flash-attn {{ tc_flash_attn }} \
+    --reasoning-format {{ tc_reasoning_format }}{% if tc_api_key | length > 0 %} \
+    --api-key {{ tc_api_key }}{% endif %}
+
+
+ExecStop=/usr/bin/docker stop --time 30 {{ tc_container_name }}
+
+TimeoutStartSec=300
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=15
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier={{ tc_service_name }}
+
+[Install]
+WantedBy=multi-user.target

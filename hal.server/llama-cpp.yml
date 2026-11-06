@@ -1,14 +1,11 @@
 ---
-# Run llama.cpp (Vulkan backend) on hal (AMD Strix Halo / gfx1151) as a Docker
-# container managed by systemd.
+# Run llama.cpp (ROCm/HIP backend) on hal (AMD Strix Halo / gfx1151) as a
+# Docker container managed by systemd. The host supplies ROCm userspace and
+# the kernel exposes /dev/kfd plus the DRM render node(s).
 #
 #   ansible-playbook llama-cpp.yml -K
-#
-# The host gets Docker and nothing else -- no ROCm, no build toolchain. Unlike
-# the retired vllm role, this backend does not need /dev/kfd or any ROCm
-# userspace: Vulkan (RADV) only needs the render node.
 
-- name: Deploy llama.cpp as a container on gfx1151 (Vulkan)
+- name: Deploy llama.cpp as a container on gfx1151 (ROCm/HIP)
   hosts: llama_cpp
   become: true
   gather_facts: true
@@ -28,17 +25,20 @@
     - name: Preflight
       tags: [preflight]
       block:
-        - name: Verify a render node exists
-          ansible.builtin.find:
-            paths: /dev/dri
-            patterns: "renderD*"
-            file_type: any
-          register: render_nodes
+        - name: Verify ROCm device nodes exist
+          ansible.builtin.stat:
+            path: "{{ item }}"
+          loop:
+            - /dev/kfd
+            - "{{ llama_cpp_render_node }}"
+          register: rocm_device_nodes
 
-        - name: Fail if no render node is present
+        - name: Fail if ROCm device nodes are missing
           ansible.builtin.assert:
-            that: render_nodes.matched > 0
-            fail_msg: "No /dev/dri/renderD* node found; the GPU is not usable."
+            that: rocm_device_nodes.results | map(attribute='stat.exists') | min
+            fail_msg: >-
+              ROCm requires /dev/kfd and {{ llama_cpp_render_node }}. Verify
+              the amdgpu driver and host ROCm setup.
 
         - name: Check free disk space
           ansible.builtin.set_fact:
@@ -56,18 +56,24 @@
 
         - name: Check whether the target model is already downloaded
           ansible.builtin.stat:
-            path: "{{ llama_cpp_models_dir }}/{{ llama_cpp_model_file }}"
+            path: "{{ llama_cpp_model_dir }}/{{ llama_cpp_model_file }}"
           register: preflight_target_weights
 
         - name: Check whether the MTP draft head is already downloaded
           ansible.builtin.stat:
-            path: "{{ llama_cpp_models_dir }}/{{ llama_cpp_model_draft_file }}"
+            path: "{{ llama_cpp_model_dir }}/{{ llama_cpp_model_draft_file }}"
           register: preflight_draft_weights
 
         - name: Check whether the vision mmproj file is already downloaded
           ansible.builtin.stat:
-            path: "{{ llama_cpp_models_dir }}/{{ llama_cpp_model_mmproj_file }}"
+            path: "{{ llama_cpp_model_dir }}/{{ llama_cpp_model_mmproj_file }}"
           register: preflight_mmproj_weights
+
+        - name: Check whether the decision model is already downloaded
+          ansible.builtin.stat:
+            path: "{{ llama_cpp_decision_model_dir }}/{{ llama_cpp_decision_model_file }}"
+          register: preflight_decision_weights
+          when: llama_cpp_router | bool
 
         - name: Compute the space still required
           ansible.builtin.set_fact:
@@ -77,6 +83,9 @@
                      if (not preflight_target_weights.stat.exists
                          or not preflight_draft_weights.stat.exists
                          or not preflight_mmproj_weights.stat.exists) else 0)
+                  + ((llama_cpp_decision_model_disk_gb | default(0))
+                     if (llama_cpp_router | bool
+                         and not (preflight_decision_weights.stat.exists | default(false))) else 0)
                   + llama_cpp_disk_headroom_gb) | float }}
 
         - name: Fail if the disk cannot hold what is still missing
@@ -91,6 +100,9 @@
                      or not preflight_draft_weights.stat.exists
                      or not preflight_mmproj_weights.stat.exists)
                  else 'model + MTP + mmproj weights already present' }};
+              {{ 'decision model ' ~ llama_cpp_decision_model_disk_gb ~ ' GB'
+                 if (llama_cpp_router | bool and not (preflight_decision_weights.stat.exists | default(false)))
+                 else 'decision model already present or not in use' }};
               headroom {{ llama_cpp_disk_headroom_gb }} GB).
               sudo lvextend -l +100%FREE /dev/ubuntu-vg/ubuntu-lv && sudo resize2fs /dev/ubuntu-vg/ubuntu-lv
             success_msg: >-
@@ -162,34 +174,38 @@
           loop: "{{ docker_group_users }}"
 
     # -----------------------------------------------------------------------
-    - name: Resolve the video group ID
-      tags: [always]
+    - name: Resolve the ROCm device group IDs
+      tags: [preflight, service, verify]
       block:
-        # /dev/dri/renderD* is owned by the host's `video` GID; --group-add
-        # resolves names against the container's /etc/group, so this must be
-        # passed as a number.
-        - name: Look up the video group
-          ansible.builtin.getent:
-            database: group
-            key: "{{ llama_cpp_video_gid_group }}"
+        # Docker --group-add needs numeric GIDs, not host group names. Read
+        # them from the actual device ownership to match this machine's udev.
+        - name: Stat ROCm device nodes for group IDs
+          ansible.builtin.stat:
+            path: "{{ item }}"
+          loop:
+            - /dev/kfd
+            - "{{ llama_cpp_render_node }}"
+          register: llama_cpp_rocm_device_nodes
 
-        - name: Record the video GID
+        - name: Record ROCm device GIDs
           ansible.builtin.set_fact:
-            llama_cpp_video_gid: "{{ ansible_facts.getent_group[llama_cpp_video_gid_group][1] }}"
+            llama_cpp_device_gids: >-
+              {{ [llama_cpp_rocm_device_nodes.results[0].stat.gid,
+                  llama_cpp_rocm_device_nodes.results[1].stat.gid] | unique }}
 
         - name: Grant users host-side access to the GPU device
           ansible.builtin.user:
             name: "{{ item }}"
-            groups: "{{ [llama_cpp_video_gid_group] }}"
+            groups: "{{ llama_cpp_device_groups | join(',') }}"
             append: true
-          loop: "{{ llama_cpp_video_group_users }}"
+          loop: "{{ llama_cpp_device_group_users }}"
           register: gpu_groups
 
         - name: Note that group changes need a new login
           ansible.builtin.debug:
             msg: >-
               Added {{ gpu_groups.results | selectattr('changed') | map(attribute='item') | join(', ') }}
-              to {{ llama_cpp_video_gid_group }}. Log out and back in for it to take effect.
+              to {{ llama_cpp_device_groups | join(', ') }}. Log out and back in for it to take effect.
           when: gpu_groups.results | selectattr('changed') | list | length > 0
 
     # -----------------------------------------------------------------------
@@ -204,6 +220,8 @@
       loop:
         - "{{ llama_cpp_home }}"
         - "{{ llama_cpp_models_dir }}"
+        - "{{ llama_cpp_model_dir }}"
+        - "{{ llama_cpp_decision_model_dir }}"
 
     # -----------------------------------------------------------------------
     - name: Pull the llama.cpp image
@@ -222,11 +240,40 @@
           timeout: 600
           notify: Restart llama-cpp
 
+        # /v1/systemone (decision models) landed in build b{{ llama_cpp_min_build }}
+        # (ggml-org/llama.cpp#29818). The server-rocm tag is rolling: if the
+        # image already on the host predates that build, pull the refresh.
+        - name: Report the build of the local image
+          ansible.builtin.command: >-
+            docker run --rm --entrypoint /app/llama-server
+            {{ llama_cpp_image_ref }} --version
+          register: image_version
+          changed_when: false
+          failed_when: false
+
+        - name: Record the local image build number
+          # --version prints to stderr, like all of llama-server's logs.
+          # Use [0-9] (not \d) and no backreferences: the regex runs through two
+          # escape layers (YAML -> Jinja) and backslash forms mangle silently.
+          ansible.builtin.set_fact:
+            llama_cpp_image_build: >-
+              {{ (image_version.stderr | default('') | regex_search('build [0-9]+') | default('')).split()[-1]
+                 if (image_version.rc | default(1) == 0
+                     and (image_version.stderr | default('')) is search('build [0-9]+')) else 0 }}
+
+        - name: Pull a refresh if the local image predates /v1/systemone
+          ansible.builtin.command: "docker pull {{ llama_cpp_image_ref }}"
+          when: llama_cpp_image_build | int < llama_cpp_min_build | int
+          changed_when: true
+          timeout: 600
+          notify: Restart llama-cpp
+
     # -----------------------------------------------------------------------
     - name: Verify the container can reach the GPU
       tags: [image, verify]
       ansible.builtin.command: >-
-        docker run --rm --device /dev/dri --group-add {{ llama_cpp_video_gid }}
+        docker run --rm --device /dev/kfd --device {{ llama_cpp_render_node }}
+        {{ llama_cpp_device_gids | map('regex_replace', '^', '--group-add ') | join(' ') }}
         --entrypoint /app/llama-server {{ llama_cpp_image_ref }}
         --list-devices
       register: gpu_check
@@ -237,41 +284,103 @@
       ansible.builtin.debug:
         msg: "container sees: {{ gpu_check.stdout_lines }}"
 
-    - name: Fail if no Vulkan device was found
+    - name: Fail if no ROCm device was found
       tags: [image, verify]
       ansible.builtin.assert:
-        that: "'(none)' not in gpu_check.stdout"
+        that:
+          - "'(none)' not in gpu_check.stdout"
+          - "gpu_check.stdout | lower is search('rocm|hip')"
         fail_msg: >-
-          llama-server --list-devices reported no Vulkan device. Check that
-          the amdgpu kernel driver is loaded and /dev/dri/renderD* exists.
+          llama-server --list-devices did not report a ROCm/HIP device. Check
+          that this is a HIP-enabled image, and that /dev/kfd and
+          {{ llama_cpp_render_node }} are exposed.
 
     # -----------------------------------------------------------------------
-    - name: Download model weights
+    - name: Lay out and download model weights
       tags: [model]
       # A plain HTTPS GET, not huggingface_hub -- these are public files, not
       # a repo snapshot, so there is no need for a Python environment on the
       # host or inside a throwaway container.
-      ansible.builtin.get_url:
-        url: "{{ item.url }}"
-        dest: "{{ llama_cpp_models_dir }}/{{ item.file }}"
-        owner: matthew
-        group: matthew
-        mode: "0644"
-        timeout: 3600
-      loop:
-        - url: "{{ llama_cpp_model_url }}"
-          file: "{{ llama_cpp_model_file }}"
-        - url: "{{ llama_cpp_model_draft_url }}"
-          file: "{{ llama_cpp_model_draft_file }}"
-        - url: "{{ llama_cpp_model_mmproj_url }}"
-          file: "{{ llama_cpp_model_mmproj_file }}"
-      register: model_download
-      notify: Restart llama-cpp
+      block:
+        # One-time migration (2026-11): the served weights moved from flat
+        # files in {{ llama_cpp_models_dir }}/ into the per-model subdirectory
+        # layout the router scanner expects. mv is instant (same filesystem);
+        # the retired flat quants (Q2/Q3/Q4) and thinkingcap/ stay put, outside
+        # the scanned served/ directory.
+        - name: Stat the old and new locations of the served model files
+          ansible.builtin.stat:
+            path: "{{ item }}"
+          loop:
+            - "{{ llama_cpp_models_dir }}/{{ llama_cpp_model_file }}"
+            - "{{ llama_cpp_model_dir }}/{{ llama_cpp_model_file }}"
+            - "{{ llama_cpp_models_dir }}/{{ llama_cpp_model_draft_file }}"
+            - "{{ llama_cpp_model_dir }}/{{ llama_cpp_model_draft_file }}"
+            - "{{ llama_cpp_models_dir }}/{{ llama_cpp_model_mmproj_file }}"
+            - "{{ llama_cpp_model_dir }}/{{ llama_cpp_model_mmproj_file }}"
+          register: model_file_locs
+
+        - name: Move each legacy flat file into the served/ layout
+          ansible.builtin.command: >-
+            mv {{ model_file_locs.results[2 * item.n].item }}
+               {{ model_file_locs.results[2 * item.n + 1].item }}
+          loop:
+            - { n: 0, what: "{{ llama_cpp_model_file }}" }
+            - { n: 1, what: "{{ llama_cpp_model_draft_file }}" }
+            - { n: 2, what: "{{ llama_cpp_model_mmproj_file }}" }
+          loop_control:
+            label: "{{ item.what }}"
+          when:
+            - model_file_locs.results[2 * item.n].stat.exists
+            - not model_file_locs.results[2 * item.n + 1].stat.exists
+          changed_when: true
+          notify: Restart llama-cpp
+
+        - name: Download the served model weights
+          ansible.builtin.get_url:
+            url: "{{ item.url }}"
+            dest: "{{ llama_cpp_model_dir }}/{{ item.file }}"
+            owner: matthew
+            group: matthew
+            mode: "0644"
+            timeout: 3600
+          loop:
+            - url: "{{ llama_cpp_model_url }}"
+              file: "{{ llama_cpp_model_file }}"
+            - url: "{{ llama_cpp_model_draft_url }}"
+              file: "{{ llama_cpp_model_draft_file }}"
+            - url: "{{ llama_cpp_model_mmproj_url }}"
+              file: "{{ llama_cpp_model_mmproj_file }}"
+          register: model_download
+          notify: Restart llama-cpp
+
+        - name: Download the decision model
+          ansible.builtin.get_url:
+            url: "{{ llama_cpp_decision_model_url }}"
+            dest: "{{ llama_cpp_decision_model_dir }}/{{ llama_cpp_decision_model_file }}"
+            owner: matthew
+            group: matthew
+            mode: "0644"
+            timeout: 3600
+          when: llama_cpp_router | bool
+          register: decision_download
+          notify: Restart llama-cpp
 
     # -----------------------------------------------------------------------
     - name: Configure the systemd service
       tags: [service]
       block:
+        - name: Write the router model presets
+          ansible.builtin.template:
+            src: llama-cpp.presets.ini.j2
+            dest: "{{ llama_cpp_home }}/presets.ini"
+            owner: matthew
+            group: matthew
+            mode: "0644"
+          when: llama_cpp_router | bool
+          notify:
+            - Reload systemd
+            - Restart llama-cpp
+
         - name: Write the unit file
           ansible.builtin.template:
             src: llama-cpp.service.j2
@@ -326,15 +435,70 @@
           retries: 30
           delay: 5
 
+        # In router mode the router answers /health before the model
+        # instances finish loading; wait until every served model reports
+        # status "loaded" (load-on-startup in presets.ini).
         - name: List the served models
           ansible.builtin.uri:
             url: "http://127.0.0.1:{{ llama_cpp_port }}/v1/models"
             headers: "{{ {'Authorization': 'Bearer ' + llama_cpp_api_key} if llama_cpp_api_key | length > 0 else {} }}"
             return_content: true
           register: models
+          until: >-
+            models.status == 200
+            and ((models.json.data | selectattr('id', 'equalto', llama_cpp_served_model_name)
+                  | map(attribute='status') | map(attribute='value') | select('equalto', 'loaded') | list | length) > 0)
+            and ((not (llama_cpp_router | bool))
+                 or ((models.json.data | selectattr('id', 'equalto', llama_cpp_decision_model_name)
+                      | map(attribute='status') | map(attribute='value') | select('equalto', 'loaded') | list | length) > 0))
+          retries: 60
+          delay: 5
+
+        - name: Probe /v1/systemone with a decision request
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ llama_cpp_port }}/v1/systemone"
+            method: POST
+            body_format: json
+            body:
+              model: "{{ llama_cpp_decision_model_name }}"
+              state: "Customer message: I was charged twice for my order last week and nobody has replied."
+              questions:
+                route:
+                  type: choice
+                  instructions: "Which team should handle this?"
+                  criteria:
+                    billing: ~
+                    shipping: ~
+                    technical: ~
+            headers: "{{ {'Authorization': 'Bearer ' + llama_cpp_api_key} if llama_cpp_api_key | length > 0 else {} }}"
+            status_code: 200
+            return_content: true
+            timeout: 120
+          register: systemone
+          when: llama_cpp_router | bool
+          retries: 3
+          delay: 5
+
+        - name: Assert the decision endpoint answered
+          ansible.builtin.assert:
+            that:
+              - systemone.status == 200
+              - "'route' in systemone.json.answers"
+              - systemone.json.answers.route.type == 'choice'
+              - systemone.json.answers.route.choice in ['billing', 'shipping', 'technical']
+            fail_msg: >-
+              /v1/systemone did not return a typed answer: {{ systemone.json }}
+          when: llama_cpp_router | bool
 
         - name: Report the endpoint
           ansible.builtin.debug:
             msg:
               - "llama.cpp is serving: {{ models.json.data | map(attribute='id') | join(', ') }}"
               - "Endpoint: http://{{ ansible_host }}:{{ llama_cpp_port }}/v1"
+              - >-
+                {% if llama_cpp_router | bool %}
+                Decision model: POST /v1/systemone with "model": "{{ llama_cpp_decision_model_name }}"
+                (answered probe: {{ systemone.json.answers.route.choice | default('n/a') }})
+                {% else %}
+                Single-model mode: /v1/systemone is not served; set llama_cpp_router: true to enable it.
+                {% endif %}

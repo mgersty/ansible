@@ -9,11 +9,18 @@ laya_cpp_home: /opt/laya-cpp
 
 laya_cpp_checkout: "{{ laya_cpp_home }}/src"
 laya_cpp_build_dir: "{{ laya_cpp_checkout }}/build-vulkan"
-# The general English checkpoint lives directly in laya.cpp's model root.
+# The selected variant's checkpoint lives directly in laya.cpp's model root.
+# Retired 2026-11-04: the `english` checkpoint (convaiinnovations/laya @
+# 55cf4c4e) was replaced by `typed-decisions` below -- on S1MB's own
+# laya--typed-decisions-* tasks the english variant scores near floor
+# (choice 0.020 / noul 0.007 / score 0.004, Task Avg 13.4 overall, rank
+# 181/228), while typed-decisions does choice 0.287 / noul 0.444 / score
+# 0.635 on the same tasks. Same ModernBERT-large encoder architecture, so no
+# build changes; only the checkpoint download and --variant flag differ.
 laya_cpp_model_dir: "{{ laya_cpp_home }}/models/laya"
 laya_cpp_checkpoint_dir: "{{ laya_cpp_model_dir }}"
-laya_cpp_model_repo: "convaiinnovations/laya"
-laya_cpp_model_revision: "55cf4c4ebb4ebe31b2550e8bdf3bd21b99753851"
+laya_cpp_model_repo: "convaiinnovations/laya-typed-decisions"
+laya_cpp_model_revision: "e929ae5cf69bc34259cd2f95c9e91145b818b1f0"
 
 laya_cpp_build_jobs: 16
 laya_cpp_force_build: false
@@ -28,7 +35,7 @@ laya_cpp_health_path: /health
 laya_cpp_health_status: 200
 laya_cpp_verify_endpoint: true
 
-laya_cpp_variant: english
+laya_cpp_variant: typed-decisions
 laya_cpp_model_path: "{{ laya_cpp_model_dir }}"
 
 laya_cpp_server_args:

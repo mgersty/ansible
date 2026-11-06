@@ -24,7 +24,7 @@ case "$BACKEND" in
             --host "${LAYA_HOST:-0.0.0.0}" \
             --port "${LAYA_PORT:-8001}" \
             --model "${LAYA_MODEL_DIR:-/models/laya}" \
-            --variant "${LAYA_VARIANT:-english}" \
+            --variant "${LAYA_VARIANT:-typed-decisions}" \
             --cpu \
             "$@"
         ;;
@@ -39,7 +39,7 @@ case "$BACKEND" in
             --host "${LAYA_HOST:-0.0.0.0}" \
             --port "${LAYA_PORT:-8001}" \
             --model "${LAYA_MODEL_DIR:-/models/laya}" \
-            --variant "${LAYA_VARIANT:-english}" \
+            --variant "${LAYA_VARIANT:-typed-decisions}" \
             --vulkan \
             "$@"
         ;;
@@ -49,7 +49,7 @@ case "$BACKEND" in
             --host "${LAYA_HOST:-0.0.0.0}" \
             --port "${LAYA_PORT:-8001}" \
             --model "${LAYA_MODEL_DIR:-/models/laya}" \
-            --variant "${LAYA_VARIANT:-english}" \
+            --variant "${LAYA_VARIANT:-typed-decisions}" \
             --vulkan \
             "$@"
         ;;

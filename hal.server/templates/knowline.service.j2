@@ -1,0 +1,44 @@
+[Unit]
+Description=llama.cpp OpenAI-compatible API server ({{ knowline_served_model_name }}, ROCm/HIP)
+Documentation=https://github.com/ggml-org/llama.cpp
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStartPre=-/usr/bin/docker rm -f {{ knowline_container_name }}
+
+ExecStart=/usr/bin/docker run --rm --name {{ knowline_container_name }} \
+    --device /dev/kfd \
+    --device {{ knowline_render_node }} \
+{% for gid in knowline_device_gids %}    --group-add {{ gid }} \
+{% endfor %}    --publish {{ knowline_bind_host }}:{{ knowline_port }}:{{ knowline_container_port }} \
+    --volume {{ knowline_models_dir }}:{{ knowline_container_models_dir }} \
+    {{ knowline_image_ref }} \
+    --model {{ knowline_container_models_dir }}/{{ knowline_model_file }} \
+{% if knowline_model_mmproj_file | default('') | length > 0 %}    --mmproj {{ knowline_container_models_dir }}/{{ knowline_model_mmproj_file }} \
+{% endif %}    --alias {{ knowline_served_model_name }} \
+    --host 0.0.0.0 \
+    --port {{ knowline_container_port }} \
+    --ctx-size {{ knowline_ctx_size }} \
+    --gpu-layers {{ knowline_gpu_layers }} \
+    --flash-attn auto{% if knowline_api_key | length > 0 %} \
+    --api-key {{ knowline_api_key }}{% endif %}{% for arg in knowline_extra_args %} \
+    {{ arg }}{% endfor %}
+
+
+ExecStop=/usr/bin/docker stop --time 30 {{ knowline_container_name }}
+
+# 4B model: cold load is seconds; 300s is generous headroom.
+TimeoutStartSec=300
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=15
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier={{ knowline_service_name }}
+
+[Install]
+WantedBy=multi-user.target
