@@ -9,11 +9,11 @@ The llama.cpp playbooks expect Docker and a ROCm/HIP-enabled image; host ROCm
 userspace is provisioned separately. The playbooks do not install ROCm. The
 legacy vLLM playbook has its own containerized ROCm setup.
 
-**Current deployment: llama.cpp (ROCm/HIP) in router mode, serving Qwen3.8-27B
-and the Kev-4B decision model on one port.** The service exposes the usual
-OpenAI endpoints (`qwen3.8-27b`) plus llama.cpp's native `POST /v1/systemone`
-typed-decision endpoint (`kev-4b`) — see [Decision models via
-`/v1/systemone`](#decision-models-via-v1systemone). vLLM served a 30B model
+**Current deployment: two llama.cpp (ROCm/HIP) services, one per model.**
+`llama-cpp` serves Qwen3.8-27B on `:8000` with the usual OpenAI endpoints
+(`qwen3.8-27b`); `kev-4b` serves the Kev-4B decision model on `:8003` with
+llama.cpp's native `POST /v1/systemone` typed-decision endpoint — see
+[Decision models via `/v1/systemone`](#decision-models-via-v1systemone). vLLM served a 30B model
 here until 2026-09-05, when we hit a hardware ceiling with a follow-up model
 (below) and pivoted. Both playbooks are kept in this directory — see [Why we
 moved off vLLM](#why-we-moved-off-vllm) — but only run one engine at a time;
@@ -44,7 +44,7 @@ hal.server/
 ├── ansible.cfg                  # inventory + become_ask_pass (hal needs a sudo password)
 ├── inventory.yml                # hal -> 10.1.1.105, in the vllm, llama_cpp, laya_cpp, knowline, trocr groups
 ├── group_vars/
-│   ├── llama_cpp.yml            # current: image backend, models (chat + decision), router, tunables
+│   ├── llama_cpp.yml            # current: image backend, models (chat + decision), ports, tunables
 │   ├── laya_cpp.yml             # laya.cpp: source pin, model revision, server args
 │   ├── knowline.yml             # KnowLine decision model: image, GGUF, server args
 │   └── vllm.yml                 # retired: kept for rollback, see below
@@ -53,16 +53,16 @@ hal.server/
 │       ├── Dockerfile           # laya.cpp CPU/Vulkan server image
 │       ├── entrypoint.sh        # preserves server defaults while accepting runtime flags
 │       └── README.md
-├── llama-cpp.yml                # current playbook (router mode: chat + decision model)
-├── systemone-example.sh         # curl example for POST /v1/systemone on llama-cpp.service
+├── llama-cpp.yml                # current playbook (two services: chat + decision model)
+├── systemone-example.sh         # curl example for POST /v1/systemone on kev-4b.service
 ├── laya.cpp.yml                 # laya.cpp (typed-decision model) build and service (superseded, see below)
 ├── knowline.yml                 # KnowLine-4B-Gen5.5 decision model (2nd llama.cpp container, :8002)
 ├── thinkingcap.yml              # ThinkingCap Qwen3.8-27B (2nd container, :8010); no inventory group currently
 ├── vllm.yml                     # retired playbook, still runnable
 ├── uninstall.yaml               # vLLM teardown (llama.cpp has no equivalent yet)
 └── templates/
-    ├── llama-cpp.service.j2     # current: systemd unit wrapping `docker run` (router + single-model branches)
-    ├── llama-cpp.presets.ini.j2 # router-mode per-model presets (ctx, MTP draft, reasoning-format)
+    ├── llama-cpp.service.j2     # current: systemd unit wrapping `docker run` for the chat model (:8000)
+    ├── kev-4b.service.j2        # systemd unit wrapping `docker run` for the Kev-4B decision model (:8003)
     ├── knowline.service.j2      # KnowLine decision model: systemd unit wrapping `docker run`
     ├── vllm.service.j2          # retired
     └── vllm.env.j2              # retired
@@ -145,37 +145,29 @@ one forward pass. Decision models are ordinary GGUFs flagged with
 `{arch}.decision.type` metadata, so the chat model cannot answer them; a
 decision model has to be loaded.
 
-`llama-cpp.service` runs llama.cpp's built-in **model router** for this: no
-`--model` on the command line, instead `--models-dir` + `--models-preset`.
-The router discovers one model per subdirectory of
-`/opt/llama-cpp/models/served/` (the directory name is the served model id and
-auto-wires `*mmproj*` / `mtp-*` sidecar files inside it), spawns one
-`llama-server` child per model (re-executing its own `/app/llama-server`), and
-proxies by the `"model"` request field. Both models load at startup
-(`load-on-startup` in `presets.ini`); `--models-memory-margin` keeps 8 GiB of
-GPU headroom and LRU-unloads idle models if a load does not fit.
+`kev-4b.service` runs a second llama.cpp container (same image, same GPU,
+shared `/opt/llama-cpp` home) dedicated to the decision model: a classic
+single-model `llama-server` with `--model
+/models/served/kev-4b/Kev-4B-Q4_K_M.gguf --alias kev-4b --ctx-size 8192`,
+published on `:8003`. The chat model stays on `llama-cpp.service` (`:8000`)
+exactly as before.
 
-Served on `:8000`:
+| service | port | model | endpoints |
+|---|---|---|---|
+| `llama-cpp` | `:8000` | `qwen3.8-27b` (UD-Q8_K_XL + MTP draft + mmproj) | `/v1/chat/completions`, `/v1/completions`, … |
+| `kev-4b` | `:8003` | `kev-4b` (ggml-org/Kev-4B-GGUF, Q4_K_M, 3 GB, Apache-2.0) | `/v1/systemone` |
 
-| id | role | endpoints |
-|---|---|---|
-| `qwen3.8-27b` | chat (UD-Q8_K_XL + MTP draft + mmproj, as before) | `/v1/chat/completions`, `/v1/completions`, … |
-| `kev-4b` | decision model (ggml-org/Kev-4B-GGUF, Q4_K_M, 3 GB, Apache-2.0) | `/v1/systemone` |
+Chat clients are unchanged: `llama-cpp` still answers `model: "qwen3.8-27b"`
+on `:8000`. Decision clients point at `:8003` and keep the `"model"` field at
+the level of `state` — see `systemone-example.sh`. Other ggml decision models
+(Julia-1, Laya, lev, OpenJev, Clef) drop in by changing
+`llama_cpp_decision_model_*` in `group_vars/llama_cpp.yml` and re-running —
+the unit, directory and served id all follow those variables.
 
-Existing clients are unchanged: they already send `model: "qwen3.8-27b"`, which
-is the id the router uses. Decision requests add the same field at the level
-of `state` — see `systemone-example.sh`. Other ggml decision models (Julia-1,
-Laya, lev, OpenJev, Clef) drop in by changing `llama_cpp_decision_model_*` in
-`group_vars/llama_cpp.yml` and re-running; `GET /v1/models` advertises
-`output_modalities: ["decisions"]` for them, including while unloaded. The
-router scan is confined to `models/served/`, so the retired flat quants and the
-`thinkingcap/` subdirectory in `/opt/llama-cpp/models/` are not registered as
-models. Roll back to the classic single-model unit any time with
-`-e llama_cpp_router=false` (same weight layout).
-
-`GET /v1/models` in router mode reports each model's `status` (`unloaded`,
-`loading`, `loaded`), and `GET /models?reload=1` re-scans the directory after
-adding a new subdirectory.
+Weights for both services live side by side in `/opt/llama-cpp/models/served/`
+(one subdirectory per model), so the split did not re-download anything; the
+retired flat quants and the `thinkingcap/` subdirectory in
+`/opt/llama-cpp/models/` are simply not mounted as `--model` by either unit.
 
 ## Laya and laya.cpp
 
@@ -217,22 +209,24 @@ same GPU, consider stopping llama.cpp while running laya.cpp workloads.
 
 ## How it runs
 
-systemd owns a foreground `docker run --rm`, so `systemctl status llama-cpp`
-reflects the real container state and there is no detached container to drift
-out of sync:
+systemd owns a foreground `docker run --rm` per service, so
+`systemctl status llama-cpp` / `systemctl status kev-4b` reflect the real
+container state and there is no detached container to drift out of sync:
 
 ```
 ExecStartPre=-/usr/bin/docker rm -f llama-cpp   # clear a container left by an unclean stop
 ExecStart=/usr/bin/docker run --rm --name llama-cpp ... <image> \
-    --models-dir /opt/llama-cpp/models/served --models-preset /opt/llama-cpp/presets.ini \
-    --models-max 2 --models-memory-margin 8192 --host 0.0.0.0 --port 8080
+    --model /models/served/qwen3.8-27b/Qwen3.8-27B-UD-Q8_K_XL.gguf --alias qwen3.8-27b \
+    --host 0.0.0.0 --port 8080        # published on :8000
 ExecStop=/usr/bin/docker stop --time 30 llama-cpp
 ```
 
-The router answers `/health` as soon as it is up; model instances load in the
-background (`load-on-startup`), which is why the playbook's verify step polls
-`/v1/models` until every served model reports `status: loaded` before probing
-`/v1/systemone`.
+`kev-4b.service` is the same shape with `--model /models/served/kev-4b/Kev-4B-Q4_K_M.gguf
+--alias kev-4b --ctx-size 8192`, published on `:8003`. Both mount
+`/opt/llama-cpp/models` at `/models` and share the image and GPU (≈31.5 GB +
+≈3 GB of weights fit the 64 GiB card comfortably). The playbook's verify step
+polls `/health` on both ports, checks each service's `/v1/models`, then probes
+`/v1/systemone` on `:8003`.
 
 ## Measured on hal
 
@@ -301,8 +295,8 @@ curl http://10.1.1.105:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"hello"}]}'
 
-# Typed decision (router mode: "model" picks the decision model)
-curl http://10.1.1.105:8000/v1/systemone \
+# Typed decision (kev-4b service, its own port)
+curl http://10.1.1.105:8003/v1/systemone \
   -H 'Content-Type: application/json' \
   -d '{"model":"kev-4b","state":"Customer message: I was charged twice for my order.",
        "questions":{"route":{"type":"choice",
@@ -310,8 +304,8 @@ curl http://10.1.1.105:8000/v1/systemone \
              "criteria":{"billing":null,"shipping":null,"technical":null}}}}'
 ```
 
-`/v1/systemone` against the chat model answers 501 `This model is not a
-decision model` — expected; decision questions go to `kev-4b`.
+`/v1/systemone` against the chat model on `:8000` answers 501 `This model is
+not a decision model` — expected; decision questions go to `kev-4b` on `:8003`.
 
 ## Things worth knowing (llama.cpp / current)
 
@@ -328,14 +322,11 @@ decision model` — expected; decision questions go to `kev-4b`.
   `model` field is the literal in-container file path
   (e.g. `/models/Qwen3.8-27B-UD-Q3_K_XL.gguf`), which is what you'll see if you
   ever run the image manually without this flag.
-- **Router mode: the served model id is the subdirectory name.** In router
-  mode `--alias` does not apply (the router controls it); ids come from the
-  directory names under `/opt/llama-cpp/models/served/`. That is why the chat
-  model's directory is named exactly `qwen3.8-27b` — existing clients send that
-  id and keep working. Per-model flags (`ctx-size`, `spec-type`,
-  `reasoning-format`, …) live in `presets.ini`, not on the command line; the
-  router strips its own reserved args (host, port, api-key, alias) and
-  overlays its CLI args onto every instance.
+- **Each service is a classic single-model `llama-server`.** The served model
+  id is the `--alias` flag, and per-model flags (`ctx-size`, `spec-type`,
+  `reasoning-format`, …) are on each unit's command line. The two containers
+  share `/opt/llama-cpp/models` (mounted at `/models`), the image and the GPU;
+  chat answers on `:8000`, decisions on `:8003`.
 - **`--reasoning-format deepseek` puts the model's `<think>...</think>` output
   in `message.reasoning_content`** instead of leaving it inline in
   `message.content`. This model is a hybrid thinking/non-thinking model (same

@@ -1,6 +1,6 @@
 {{ ansible_managed | comment }}
 [Unit]
-Description=llama.cpp API server ({{ llama_cpp_served_model_name }}{% if llama_cpp_router | bool %} + {{ llama_cpp_decision_model_name }} decision model, router mode{% endif %}, ROCm/HIP)
+Description=llama.cpp API server ({{ llama_cpp_served_model_name }}, ROCm/HIP)
 Documentation=https://github.com/ggml-org/llama.cpp
 Requires=docker.service
 After=docker.service network-online.target
@@ -9,31 +9,6 @@ Wants=network-online.target
 [Service]
 Type=exec
 ExecStartPre=-/usr/bin/docker rm -f {{ llama_cpp_container_name }}
-{% if llama_cpp_router | bool %}
-; Router mode: no --model on the command line. The router discovers models in
-; --models-dir (one per subdirectory: model gguf + *mmproj* + *mtp-* sidecars)
-; and per-model flags from --models-preset. It spawns one llama-server child
-; per model (re-executing its own /app/llama-server binary) and proxies by
-; the "model" field, so /v1/chat/completions routes to {{ llama_cpp_served_model_name }}
-; and /v1/systemone to {{ llama_cpp_decision_model_name }} on the same port.
-ExecStart=/usr/bin/docker run --rm --name {{ llama_cpp_container_name }} \
-    --device /dev/kfd \
-    --device {{ llama_cpp_render_node }} \
-{% for gid in llama_cpp_device_gids %}    --group-add {{ gid }} \
-{% endfor %}    --publish {{ llama_cpp_bind_host }}:{{ llama_cpp_port }}:8080 \
-    --volume {{ llama_cpp_home }}:{{ llama_cpp_container_home }} \
-    {{ llama_cpp_image_ref }} \
-    --models-dir {{ llama_cpp_container_home }}/models/served \
-    --models-preset {{ llama_cpp_container_presets_file }} \
-    --models-max {{ llama_cpp_models_max }} \
-    --models-memory-margin {{ llama_cpp_models_memory_margin }} \
-    --host 0.0.0.0 \
-    --port 8080{% if llama_cpp_api_key | length > 0 %} \
-    --api-key {{ llama_cpp_api_key }}{% endif %}{% for arg in llama_cpp_extra_args %} \
-    {{ arg }}{% endfor %}
-{% else %}
-; Single-model mode (rollback path): classic llama-server with the chat model
-; only. Weights live in the same served/ layout the router uses.
 ExecStart=/usr/bin/docker run --rm --name {{ llama_cpp_container_name }} \
     --device /dev/kfd \
     --device {{ llama_cpp_render_node }} \
@@ -55,15 +30,12 @@ ExecStart=/usr/bin/docker run --rm --name {{ llama_cpp_container_name }} \
     --reasoning-format {{ llama_cpp_reasoning_format }}{% if llama_cpp_api_key | length > 0 %} \
     --api-key {{ llama_cpp_api_key }}{% endif %}{% for arg in llama_cpp_extra_args %} \
     {{ arg }}{% endfor %}
-{% endif %}
 
 ExecStop=/usr/bin/docker stop --time 30 {{ llama_cpp_container_name }}
 
 # llama.cpp loads in seconds (no torch.compile/CUDA-graph warmup like vLLM),
 # so this does not need vLLM's 1800s allowance -- 300s is generous headroom
-# for a cold model-weight read from disk. In router mode both models load at
-# startup ({{ llama_cpp_model_file }} + {{ llama_cpp_decision_model_file }}),
-# so the headroom covers the sum.
+# for a cold model-weight read from disk.
 TimeoutStartSec=300
 TimeoutStopSec=60
 Restart=on-failure

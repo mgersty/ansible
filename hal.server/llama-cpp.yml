@@ -1,11 +1,14 @@
 ---
-# Run llama.cpp (ROCm/HIP backend) on hal (AMD Strix Halo / gfx1151) as a
-# Docker container managed by systemd. The host supplies ROCm userspace and
-# the kernel exposes /dev/kfd plus the DRM render node(s).
+# Run llama.cpp (ROCm/HIP backend) on hal (AMD Strix Halo / gfx1151) as two
+# Docker containers managed by systemd -- one service per model:
+#   llama-cpp  qwen3.8-27b chat model (OpenAI endpoints) on :8000
+#   kev-4b     Kev-4B decision model (native POST /v1/systemone) on :8003
+# The host supplies ROCm userspace and the kernel exposes /dev/kfd plus the
+# DRM render node(s).
 #
 #   ansible-playbook llama-cpp.yml -K
 
-- name: Deploy llama.cpp as a container on gfx1151 (ROCm/HIP)
+- name: Deploy llama.cpp chat + decision services on gfx1151 (ROCm/HIP)
   hosts: llama_cpp
   become: true
   gather_facts: true
@@ -18,6 +21,11 @@
     - name: Restart llama-cpp
       ansible.builtin.systemd_service:
         name: "{{ llama_cpp_service_name }}"
+        state: restarted
+
+    - name: Restart kev-4b
+      ansible.builtin.systemd_service:
+        name: "{{ llama_cpp_kev_service_name }}"
         state: restarted
 
   tasks:
@@ -54,7 +62,7 @@
           changed_when: false
           failed_when: false
 
-        - name: Check whether the target model is already downloaded
+        - name: Check whether the chat model is already downloaded
           ansible.builtin.stat:
             path: "{{ llama_cpp_model_dir }}/{{ llama_cpp_model_file }}"
           register: preflight_target_weights
@@ -73,7 +81,6 @@
           ansible.builtin.stat:
             path: "{{ llama_cpp_decision_model_dir }}/{{ llama_cpp_decision_model_file }}"
           register: preflight_decision_weights
-          when: llama_cpp_router | bool
 
         - name: Compute the space still required
           ansible.builtin.set_fact:
@@ -84,8 +91,7 @@
                          or not preflight_draft_weights.stat.exists
                          or not preflight_mmproj_weights.stat.exists) else 0)
                   + ((llama_cpp_decision_model_disk_gb | default(0))
-                     if (llama_cpp_router | bool
-                         and not (preflight_decision_weights.stat.exists | default(false))) else 0)
+                     if (not preflight_decision_weights.stat.exists) else 0)
                   + llama_cpp_disk_headroom_gb) | float }}
 
         - name: Fail if the disk cannot hold what is still missing
@@ -95,14 +101,14 @@
               Only {{ llama_cpp_free_gb }} GB free on / but {{ llama_cpp_required_gb }} GB
               is still required
               ({{ 'image ' ~ llama_cpp_image_disk_gb ~ ' GB' if preflight_image.rc | default(1) != 0 else 'image already pulled' }};
-              {{ 'model + MTP + mmproj weights ' ~ llama_cpp_model_disk_gb ~ ' GB'
+              {{ 'chat model + MTP + mmproj weights ' ~ llama_cpp_model_disk_gb ~ ' GB'
                  if (not preflight_target_weights.stat.exists
                      or not preflight_draft_weights.stat.exists
                      or not preflight_mmproj_weights.stat.exists)
-                 else 'model + MTP + mmproj weights already present' }};
+                 else 'chat model + MTP + mmproj weights already present' }};
               {{ 'decision model ' ~ llama_cpp_decision_model_disk_gb ~ ' GB'
-                 if (llama_cpp_router | bool and not (preflight_decision_weights.stat.exists | default(false)))
-                 else 'decision model already present or not in use' }};
+                 if (not preflight_decision_weights.stat.exists)
+                 else 'decision model already present' }};
               headroom {{ llama_cpp_disk_headroom_gb }} GB).
               sudo lvextend -l +100%FREE /dev/ubuntu-vg/ubuntu-lv && sudo resize2fs /dev/ubuntu-vg/ubuntu-lv
             success_msg: >-
@@ -238,11 +244,14 @@
           when: image_present.rc != 0
           changed_when: true
           timeout: 600
-          notify: Restart llama-cpp
+          notify:
+            - Restart llama-cpp
+            - Restart kev-4b
 
         # /v1/systemone (decision models) landed in build b{{ llama_cpp_min_build }}
         # (ggml-org/llama.cpp#29818). The server-rocm tag is rolling: if the
-        # image already on the host predates that build, pull the refresh.
+        # image already on the host predates that build, pull the refresh --
+        # the kev-4b service needs it for POST /v1/systemone.
         - name: Report the build of the local image
           ansible.builtin.command: >-
             docker run --rm --entrypoint /app/llama-server
@@ -266,7 +275,9 @@
           when: llama_cpp_image_build | int < llama_cpp_min_build | int
           changed_when: true
           timeout: 600
-          notify: Restart llama-cpp
+          notify:
+            - Restart llama-cpp
+            - Restart kev-4b
 
     # -----------------------------------------------------------------------
     - name: Verify the container can reach the GPU
@@ -304,10 +315,9 @@
       block:
         # One-time migration (2026-11): the served weights moved from flat
         # files in {{ llama_cpp_models_dir }}/ into the per-model subdirectory
-        # layout the router scanner expects. mv is instant (same filesystem);
-        # the retired flat quants (Q2/Q3/Q4) and thinkingcap/ stay put, outside
-        # the scanned served/ directory.
-        - name: Stat the old and new locations of the served model files
+        # layout. mv is instant (same filesystem); the retired flat quants
+        # (Q2/Q3/Q4) and thinkingcap/ stay put, outside the served/ directory.
+        - name: Stat the old and new locations of the chat model files
           ansible.builtin.stat:
             path: "{{ item }}"
           loop:
@@ -335,7 +345,7 @@
           changed_when: true
           notify: Restart llama-cpp
 
-        - name: Download the served model weights
+        - name: Download the chat model weights
           ansible.builtin.get_url:
             url: "{{ item.url }}"
             dest: "{{ llama_cpp_model_dir }}/{{ item.file }}"
@@ -361,27 +371,14 @@
             group: matthew
             mode: "0644"
             timeout: 3600
-          when: llama_cpp_router | bool
           register: decision_download
-          notify: Restart llama-cpp
+          notify: Restart kev-4b
 
     # -----------------------------------------------------------------------
-    - name: Configure the systemd service
+    - name: Configure the systemd services
       tags: [service]
       block:
-        - name: Write the router model presets
-          ansible.builtin.template:
-            src: llama-cpp.presets.ini.j2
-            dest: "{{ llama_cpp_home }}/presets.ini"
-            owner: matthew
-            group: matthew
-            mode: "0644"
-          when: llama_cpp_router | bool
-          notify:
-            - Reload systemd
-            - Restart llama-cpp
-
-        - name: Write the unit file
+        - name: Write the llama-cpp (chat) unit file
           ansible.builtin.template:
             src: llama-cpp.service.j2
             dest: "/etc/systemd/system/{{ llama_cpp_service_name }}.service"
@@ -392,18 +389,44 @@
             - Reload systemd
             - Restart llama-cpp
 
-        - name: Flush handlers so the service starts with current config
+        - name: Write the kev-4b (decision) unit file
+          ansible.builtin.template:
+            src: kev-4b.service.j2
+            dest: "/etc/systemd/system/{{ llama_cpp_kev_service_name }}.service"
+            owner: root
+            group: root
+            mode: "0644"
+          notify:
+            - Reload systemd
+            - Restart kev-4b
+
+        - name: Remove the retired router-mode presets file
+          # The 2026-11 router mode read /opt/llama-cpp/presets.ini; the two
+          # per-model units do not. Inert once the units above are re-rendered,
+          # so no handler is needed here.
+          ansible.builtin.file:
+            path: "{{ llama_cpp_home }}/presets.ini"
+            state: absent
+
+        - name: Flush handlers so the services start with current config
           ansible.builtin.meta: flush_handlers
 
-        - name: Enable and start llama.cpp
+        - name: Enable and start llama-cpp
           ansible.builtin.systemd_service:
             name: "{{ llama_cpp_service_name }}"
             enabled: true
             state: started
             daemon_reload: true
 
+        - name: Enable and start kev-4b
+          ansible.builtin.systemd_service:
+            name: "{{ llama_cpp_kev_service_name }}"
+            enabled: true
+            state: started
+            daemon_reload: true
+
     # -----------------------------------------------------------------------
-    - name: Open the API port
+    - name: Open the API ports
       tags: [firewall]
       when: llama_cpp_manage_firewall | bool
       block:
@@ -413,50 +436,68 @@
           changed_when: false
           failed_when: false
 
-        - name: Allow the llama.cpp port from the local network
+        - name: Allow the service ports from the local network
           community.general.ufw:
             rule: allow
-            port: "{{ llama_cpp_port }}"
+            port: "{{ item.port }}"
             proto: tcp
             src: "{{ llama_cpp_firewall_source }}"
-            comment: "llama.cpp API"
+            comment: "{{ item.comment }}"
+          loop:
+            - { port: "{{ llama_cpp_port }}", comment: "llama.cpp API" }
+            - { port: "{{ llama_cpp_kev_port }}", comment: "kev-4b decision API" }
           when: ufw_status.rc == 0 and 'inactive' not in ufw_status.stdout
 
     # -----------------------------------------------------------------------
-    - name: Wait for the API to become healthy
+    - name: Wait for the APIs to become healthy
       tags: [verify]
       block:
-        - name: Poll the health endpoint
+        - name: Poll the llama-cpp (chat) health endpoint
           ansible.builtin.uri:
             url: "http://127.0.0.1:{{ llama_cpp_port }}/health"
             status_code: 200
-          register: health
-          until: health.status == 200
+          register: chat_health
+          until: chat_health.status == 200
           retries: 30
           delay: 5
 
-        # In router mode the router answers /health before the model
-        # instances finish loading; wait until every served model reports
-        # status "loaded" (load-on-startup in presets.ini).
-        - name: List the served models
+        - name: Poll the kev-4b (decision) health endpoint
           ansible.builtin.uri:
-            url: "http://127.0.0.1:{{ llama_cpp_port }}/v1/models"
+            url: "http://127.0.0.1:{{ llama_cpp_kev_port }}/health"
+            status_code: 200
+          register: decision_health
+          until: decision_health.status == 200
+          retries: 30
+          delay: 5
+
+        - name: List the models served by each service
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ item.port }}/v1/models"
             headers: "{{ {'Authorization': 'Bearer ' + llama_cpp_api_key} if llama_cpp_api_key | length > 0 else {} }}"
             return_content: true
+          loop:
+            - { port: "{{ llama_cpp_port }}", id: "{{ llama_cpp_served_model_name }}" }
+            - { port: "{{ llama_cpp_kev_port }}", id: "{{ llama_cpp_decision_model_name }}" }
           register: models
           until: >-
-            models.status == 200
-            and ((models.json.data | selectattr('id', 'equalto', llama_cpp_served_model_name)
-                  | map(attribute='status') | map(attribute='value') | select('equalto', 'loaded') | list | length) > 0)
-            and ((not (llama_cpp_router | bool))
-                 or ((models.json.data | selectattr('id', 'equalto', llama_cpp_decision_model_name)
-                      | map(attribute='status') | map(attribute='value') | select('equalto', 'loaded') | list | length) > 0))
+            models.results | map(attribute='status') | select('equalto', 200) | list | length
+            == models.results | length
           retries: 60
           delay: 5
 
-        - name: Probe /v1/systemone with a decision request
+        - name: Assert each service advertises its model
+          ansible.builtin.assert:
+            that:
+              - llama_cpp_served_model_name in models.results[0].json.data | map(attribute='id')
+              - llama_cpp_decision_model_name in models.results[1].json.data | map(attribute='id')
+            fail_msg: >-
+              Served models:
+              llama-cpp: {{ models.results[0].json.data | default([]) | map(attribute='id') | join(', ') }}
+              kev-4b: {{ models.results[1].json.data | default([]) | map(attribute='id') | join(', ') }}
+
+        - name: Probe /v1/systemone on the kev-4b service
           ansible.builtin.uri:
-            url: "http://127.0.0.1:{{ llama_cpp_port }}/v1/systemone"
+            url: "http://127.0.0.1:{{ llama_cpp_kev_port }}/v1/systemone"
             method: POST
             body_format: json
             body:
@@ -475,7 +516,6 @@
             return_content: true
             timeout: 120
           register: systemone
-          when: llama_cpp_router | bool
           retries: 3
           delay: 5
 
@@ -488,17 +528,13 @@
               - systemone.json.answers.route.choice in ['billing', 'shipping', 'technical']
             fail_msg: >-
               /v1/systemone did not return a typed answer: {{ systemone.json }}
-          when: llama_cpp_router | bool
 
-        - name: Report the endpoint
+        - name: Report the endpoints
           ansible.builtin.debug:
             msg:
-              - "llama.cpp is serving: {{ models.json.data | map(attribute='id') | join(', ') }}"
-              - "Endpoint: http://{{ ansible_host }}:{{ llama_cpp_port }}/v1"
+              - "llama-cpp is serving: {{ models.results[0].json.data | map(attribute='id') | join(', ') }} (http://{{ ansible_host }}:{{ llama_cpp_port }}/v1)"
+              - "kev-4b is serving: {{ models.results[1].json.data | map(attribute='id') | join(', ') }} (http://{{ ansible_host }}:{{ llama_cpp_kev_port }}/v1)"
               - >-
-                {% if llama_cpp_router | bool %}
-                Decision model: POST /v1/systemone with "model": "{{ llama_cpp_decision_model_name }}"
-                (answered probe: {{ systemone.json.answers.route.choice | default('n/a') }})
-                {% else %}
-                Single-model mode: /v1/systemone is not served; set llama_cpp_router: true to enable it.
-                {% endif %}
+                Decision model: POST /v1/systemone with "model":
+                "{{ llama_cpp_decision_model_name }}" (answered probe:
+                {{ systemone.json.answers.route.choice }})

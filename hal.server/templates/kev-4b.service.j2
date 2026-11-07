@@ -1,0 +1,43 @@
+{{ ansible_managed | comment }}
+[Unit]
+Description=llama.cpp decision-model API server ({{ llama_cpp_decision_model_name }} for POST /v1/systemone, ROCm/HIP)
+Documentation=https://github.com/ggml-org/llama.cpp
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStartPre=-/usr/bin/docker rm -f {{ llama_cpp_kev_container_name }}
+ExecStart=/usr/bin/docker run --rm --name {{ llama_cpp_kev_container_name }} \
+    --device /dev/kfd \
+    --device {{ llama_cpp_render_node }} \
+{% for gid in llama_cpp_device_gids %}    --group-add {{ gid }} \
+{% endfor %}    --publish {{ llama_cpp_bind_host }}:{{ llama_cpp_kev_port }}:8080 \
+    --volume {{ llama_cpp_models_dir }}:{{ llama_cpp_container_models_dir }} \
+    {{ llama_cpp_image_ref }} \
+    --model {{ llama_cpp_kev_container_model_dir }}/{{ llama_cpp_decision_model_file }} \
+    --alias {{ llama_cpp_decision_model_name }} \
+    --host 0.0.0.0 \
+    --port 8080 \
+    --ctx-size {{ llama_cpp_decision_ctx_size }} \
+    --gpu-layers {{ llama_cpp_gpu_layers }} \
+    --flash-attn {{ llama_cpp_flash_attn }}{% if llama_cpp_api_key | length > 0 %} \
+    --api-key {{ llama_cpp_api_key }}{% endif %}{% for arg in llama_cpp_extra_args %} \
+    {{ arg }}{% endfor %}
+
+ExecStop=/usr/bin/docker stop --time 30 {{ llama_cpp_kev_container_name }}
+
+# 4B decision model: cold load is seconds; 300s is generous headroom for a
+# cold weight read from disk.
+TimeoutStartSec=300
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=15
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier={{ llama_cpp_kev_service_name }}
+
+[Install]
+WantedBy=multi-user.target

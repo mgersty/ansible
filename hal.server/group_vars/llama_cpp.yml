@@ -24,39 +24,38 @@ llama_cpp_image_ref: >-
      else llama_cpp_image_repo ~ ':' ~ llama_cpp_image_tag }}
 
 # --- Service mode -------------------------------------------------------------
-# Router mode (default since 2026-11): the container runs `llama-server` with
-# --models-dir/--models-preset and serves BOTH models on one port --
-#   qwen3.8-27b  chat (OpenAI endpoints, as before)
-#   kev-4b       decision model, native POST /v1/systemone (TypeSafe System 1)
+# Two separate llama.cpp services, one per model (split from the 2026-11
+# router mode that served both on one port):
+#   llama-cpp  qwen3.8-27b  chat (OpenAI endpoints), :8000
+#   kev-4b     Kev-4B       decision model, native POST /v1/systemone
+#                           (TypeSafe System 1), :8003
+# Each service is its own container and systemd unit; both use the same
+# ROCm/HIP image, the same GPU and the shared {{ llama_cpp_home }}.
 # /v1/systemone landed in llama.cpp build b11361 (PR ggml-org/llama.cpp#29818);
 # decision models are identified by GGUF metadata ({arch}.decision.type), so the
 # chat model alone cannot answer them -- a decision model must be served too.
-# Set llama_cpp_router: false to roll back to the classic single-model unit
-# (same files, same locations).
-llama_cpp_router: true
 # Oldest llama.cpp build with /v1/systemone; the image task pulls a refresh if
 # the local image predates it. The server-rocm tag is rolling, so a fresh pull
 # is enough -- no tag change needed.
 llama_cpp_min_build: 11361
 
 # --- Host paths and service identity ----------------------------------------
+# llama-cpp service (chat model; keeps the original name and port).
 llama_cpp_container_name: llama-cpp
 llama_cpp_service_name: llama-cpp
+# kev-4b service (decision model; second container on its own port).
+llama_cpp_kev_service_name: kev-4b
+llama_cpp_kev_container_name: kev-4b
 llama_cpp_home: /opt/llama-cpp
 llama_cpp_models_dir: "{{ llama_cpp_home }}/models"
-# Router mode scans only this subdirectory for models, so unrelated GGUFs in
-# the models dir (retired quants, the thinkingcap/ subdirectory) are not
-# registered as phantom models. In-container it is {{ llama_cpp_container_home }}/models/served.
+# Weights live in a per-model subdirectory (directory name = served id). Each
+# service mounts {{ llama_cpp_models_dir }} at /models and names its own files
+# explicitly; unrelated GGUFs in the models dir (retired quants, the
+# thinkingcap/ subdirectory) are simply not mounted as --model.
 llama_cpp_served_dir: "{{ llama_cpp_models_dir }}/served"
-llama_cpp_container_home: /opt/llama-cpp
 llama_cpp_container_models_dir: /models
-llama_cpp_container_presets_file: "{{ llama_cpp_container_home }}/presets.ini"
-# Router: how many model instances may be resident at once (2 = chat + decision
-# both stay loaded; the router LRU-unloads beyond this).
-llama_cpp_models_max: 2
-# MiB of GPU memory the router keeps free per device, unloading LRU idle models
-# before a load that does not fit. 8 GiB headroom on the 64 GiB Radeon 8060S.
-llama_cpp_models_memory_margin: 8192
+llama_cpp_container_model_dir: "{{ llama_cpp_container_models_dir }}/served/{{ llama_cpp_served_model_name }}"
+llama_cpp_kev_container_model_dir: "{{ llama_cpp_container_models_dir }}/served/{{ llama_cpp_decision_model_name }}"
 
 # --- Docker ------------------------------------------------------------------
 # Shared with the vllm role. If both roles run on the same fresh host, either
@@ -122,35 +121,25 @@ llama_cpp_device_group_users:
 # --ctx-size 262144, model load ~5s (no torch.compile/CUDA-graph warmup step
 # the way vLLM has -- llama.cpp starts serving almost immediately).
 llama_cpp_model_repo: "unsloth/Qwen3.8-27B-GGUF"
-# Weights live in a per-model subdirectory: the router's --models-dir scanner
-# treats each subdirectory as one model (directory name = served id) and
-# auto-wires files inside it -- *mmproj* is the projector, *mtp-* is the
-# draft head for --model-draft. Top-level files named like those are skipped
-# by the scanner, which is what keeps the retired flat quants out of /v1/models.
+# Weights live in a per-model subdirectory (directory name = served id); the
+# unit names the files inside it explicitly. Top-level files in the models dir
+# (retired flat quants, the thinkingcap/ subdirectory) are not mounted.
 llama_cpp_model_file: "Qwen3.8-27B-UD-Q8_K_XL.gguf"
 llama_cpp_model_url: "https://huggingface.co/{{ llama_cpp_model_repo }}/resolve/main/{{ llama_cpp_model_file }}"
 llama_cpp_model_draft_file: "mtp-Qwen3.8-27B-Q4_0.gguf"
 llama_cpp_model_draft_url: "https://huggingface.co/{{ llama_cpp_model_repo }}/resolve/main/MTP/{{ llama_cpp_model_draft_file }}"
 llama_cpp_spec_draft_n_max: 3
 # Vision projector (mmproj) -- enables image input. Without it, llama-server
-# rejects image content with a 500 error. Inside the model subdirectory the
-# router picks it up automatically (filename must contain "mmproj").
+# rejects image content with a 500 error.
 llama_cpp_model_mmproj_file: "mmproj-F16.gguf"
 llama_cpp_model_mmproj_url: "https://huggingface.co/{{ llama_cpp_model_repo }}/resolve/main/{{ llama_cpp_model_mmproj_file }}"
 # Served model id (OpenAI `model` field). Kept aligned with the vLLM-era name
 # so client configs (Pi, curl examples) only need the port/backend to change.
-# In router mode the id is the model subdirectory name, so the directory is
-# created under this exact name.
+# The host model directory is created under this exact name.
 llama_cpp_served_model_name: "qwen3.8-27b"
-# Host-side model file locations (both service modes use these).
 llama_cpp_model_dir: "{{ llama_cpp_served_dir }}/{{ llama_cpp_served_model_name }}"
-# Container-side: router mode mounts the whole home dir, single mode mounts
-# just the models dir at /models (as before).
-llama_cpp_container_model_dir: >-
-  {{ (llama_cpp_container_home ~ '/models/served' if llama_cpp_router | bool else '/models/served')
-     ~ '/' ~ llama_cpp_served_model_name }}
 
-# --- Decision model (served by the same router for POST /v1/systemone) --------
+# --- Decision model (served by the kev-4b service for POST /v1/systemone) -----
 # ggml-org's official decision-model GGUFs (see
 # https://huggingface.co/blog/ggml-org/decision-models-in-llamacpp):
 #   Julia-1  144M  mmBERT-small,  50+ langs, Apache-2.0
@@ -180,16 +169,16 @@ llama_cpp_flash_attn: "auto"
 llama_cpp_reasoning_format: "deepseek"
 
 # --- Server -------------------------------------------------------------------
+# One port per service. :8001 is laya.cpp, :8002 knowline, :8010 thinkingcap.
 llama_cpp_bind_host: "0.0.0.0"
 llama_cpp_port: 8000
+llama_cpp_kev_port: 8003
 # If set, clients must send `Authorization: Bearer <key>`. Empty = open on LAN
-# (same posture as the vllm role).
+# (same posture as the vllm role). Applied to both services.
 llama_cpp_api_key: ""
 
-# Appended verbatim to the llama-server command line, after the flags the
-# template always set. One list entry per token. In router mode these land on
-# the router and are overlaid onto every model instance (e.g. /metrics works
-# with ?model=<id>).
+# Appended verbatim to each llama-server command line, after the flags the
+# templates always set. One list entry per token.
 llama_cpp_extra_args:
   - "--metrics"   # prometheus endpoint (present on the hal unit since 2026-11; kept here so the repo matches the deployment)
 
